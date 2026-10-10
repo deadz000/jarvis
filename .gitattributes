@@ -1,0 +1,10 @@
+# 统一换行符，避免 Windows 工作区产生无意义的整文件 diff
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.wasm binary
+
+*.cmd text eol=crlf
+*.bat text eol=crlf

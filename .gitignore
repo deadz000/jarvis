@@ -1,0 +1,27 @@
+# 依赖与构建产物
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 凭据与本地配置：绝不入库
+.env
+.env.*
+!.env.example
+auth.json
+.pi/
+
+# Pi 会话与运行时产物
+sessions/
+*.session.jsonl
+logs/
+*.log
+
+# 测试与工具
+coverage/
+.vitest/
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
