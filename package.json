@@ -17,6 +17,7 @@
     "example:lifecycle": "node --env-file-if-exists=.env examples/sdk/04-session-lifecycle.ts",
     "example:master": "node --env-file-if-exists=.env examples/sdk/05-master-decision.ts",
     "example:tts": "node --env-file-if-exists=.env examples/sdk/06-tts-smoke.ts",
+    "example:asr": "node --env-file-if-exists=.env examples/sdk/07-asr-smoke.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
