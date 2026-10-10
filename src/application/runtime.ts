@@ -29,6 +29,8 @@ import { DeliveryQueue } from "./delivery/delivery-queue.ts";
 import { DeliveryBatcher, type PendingResult } from "./delivery/delivery-batcher.ts";
 import { DeliveryPolicy } from "./delivery/delivery-policy.ts";
 import { TranscriptCoalescer } from "./workers/transcript-coalescer.ts";
+import { SpeechActivityTracker } from "./interaction/speech-activity.ts";
+import type { AsrPort, AsrSession } from "./input/asr-port.ts";
 import { SimulatedAudioManager, type AudioEvent, type AudioStats, type DeliveredAudioChunk } from "./delivery/audio-manager.ts";
 import type { TtsPort } from "./delivery/tts-port.ts";
 
@@ -90,6 +92,24 @@ export interface RuntimeSnapshot {
   readonly dialogue: readonly DialogueEntry[];
   /** 用户是否正在讲话（语音交付是否让路）。 */
   readonly speechActive: boolean;
+  /** 语音输入状态（ASR）。 */
+  readonly voice: {
+    /** 是否配置了 ASR（未配置时面板应隐藏麦克风）。 */
+    readonly available: boolean;
+    readonly listening: boolean;
+    /** 正在识别的中间文本（会变）。 */
+    readonly partial: string;
+    /**
+     * 收到过多少次中间结果。
+     *
+     * 为什么要有计数：中间结果更新极快（远快于界面刷新），
+     * 靠轮询 `partial` 判断"是否真的流式到达"会因竞态而漏判；
+     * 计数是稳定可观测的证据。
+     */
+    readonly partialCount: number;
+    /** 最近一次识别的终稿。 */
+    readonly lastFinal: string | null;
+  };
 }
 
 export interface JarvisRuntimeOptions {
@@ -102,9 +122,15 @@ export interface JarvisRuntimeOptions {
    * 由组合根（app.ts）根据配置构造，运行时不接触密钥。
    */
   readonly tts?: TtsPort;
+  /**
+   * 真实 ASR 端口。提供则语音输入可用；省略则面板不显示麦克风。
+   */
+  readonly asr?: AsrPort;
 }
 
 export const DEFAULT_MAX_TIMELINE_ENTRIES = 200;
+/** 推给 ASR 的采样率（单声道 PCM 16-bit LE）。 */
+export const ASR_SAMPLE_RATE = 16_000;
 /** 快照里携带的时间线条数上限：避免高频刷新时反复序列化整条历史。 */
 export const SNAPSHOT_TIMELINE_LIMIT = 80;
 
@@ -129,6 +155,18 @@ export class JarvisRuntime {
       this.emitUpdate();
     },
   });
+  private readonly asr: AsrPort | undefined;
+  /** 识别结果驱动的语音活动（驱动交付让路）。 */
+  private readonly speechTracker = new SpeechActivityTracker({
+    onActive: () => {
+      this.vadSpeechActive = true;
+      this.applySpeechState();
+    },
+    onIdle: () => {
+      this.vadSpeechActive = false;
+      this.applySpeechState();
+    },
+  });
 
   private readonly listeners = new Set<(snapshot: RuntimeSnapshot) => void>();
   private readonly audioChunkListeners = new Set<(chunk: DeliveredAudioChunk) => void>();
@@ -138,6 +176,14 @@ export class JarvisRuntime {
   private lastDecision: DecisionView | null = null;
   private stoppedToken: number | null = null;
   private speechActive = false;
+  /** 面板手动开关。 */
+  private manualSpeechActive = false;
+  /** 由 ASR 识别结果驱动的语音活动。 */
+  private vadSpeechActive = false;
+  private voiceSession: AsrSession | undefined;
+  private voicePartial = "";
+  private voicePartialCount = 0;
+  private voiceLastFinal: string | null = null;
   /** 因用户讲话而暂缓的语音交付批次（面板已经更新过，语音等合适时机）。 */
   private deferredResults: PendingResult[] = [];
   private disposed = false;
@@ -173,6 +219,8 @@ export class JarvisRuntime {
         for (const listener of [...this.audioChunkListeners]) listener(chunk);
       },
     });
+
+    this.asr = options.asr;
     this.delivery = new DeliveryQueue({ audio: this.audio });
 
     this.plane = new MasterDecisionPlane({
@@ -268,6 +316,13 @@ export class JarvisRuntime {
       timeline: this.timeline.slice(-SNAPSHOT_TIMELINE_LIMIT),
       dialogue: this.dialogue.recent(10),
       speechActive: this.speechActive,
+      voice: {
+        available: this.asr !== undefined,
+        listening: this.voiceSession !== undefined,
+        partial: this.voicePartial,
+        partialCount: this.voicePartialCount,
+        lastFinal: this.voiceLastFinal,
+      },
     };
   }
 
@@ -278,11 +333,92 @@ export class JarvisRuntime {
    * 讲话结束后把暂缓的结果放回合并窗口，与期间新产生的合批处理。
    */
   public setSpeechActive(active: boolean): void {
-    if (this.speechActive === active) return;
-    this.speechActive = active;
-    this.pushTimeline("speech_activity", active ? "用户开始讲话：语音交付让路" : "用户停止讲话：恢复语音交付");
+    this.manualSpeechActive = active;
+    this.applySpeechState();
+  }
 
-    if (!active && this.deferredResults.length > 0) {
+  /**
+   * 开始一次语音输入会话：浏览器推流 → ASR → 实时转写 → 终稿进入正常输入链路。
+   *
+   * 返回 `undefined` 表示**未配置 ASR**（能力不可用，不是失败）。
+   */
+  public startVoiceInput(): AsrSession | undefined {
+    const asr = this.asr;
+    if (asr === undefined || this.disposed) return undefined;
+    if (this.voiceSession !== undefined) this.voiceSession.abort("被新的语音输入会话取代");
+
+    const session = asr.start({
+      sampleRate: ASR_SAMPLE_RATE,
+      onPartial: (transcript) => {
+        // 收到非空识别结果 → 认为用户在说话 → 语音交付让路
+        this.speechTracker.noteSpeech();
+        this.voicePartial = transcript.text;
+        this.voicePartialCount += 1;
+        this.emitUpdate();
+      },
+      onFinal: (transcript) => {
+        this.speechTracker.noteSpeech();
+        this.voicePartial = "";
+        this.voiceLastFinal = transcript.text;
+        this.pushTimeline("voice_transcript", `识别终稿：${transcript.text}`);
+        this.emitUpdate();
+        // 终稿走**与聊天输入完全相同**的链路 → 交给 Master 决策
+        void this.handleUserInput(transcript.text).catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          this.logger?.warn("runtime.voice_input_failed", { error: message });
+          this.pushTimeline("voice_input_failed", `语音输入处理失败：${message}`);
+          this.emitUpdate();
+        });
+      },
+      onError: (error) => {
+        this.logger?.warn("runtime.asr_failed", { error: error.message });
+        this.pushTimeline("voice_error", `语音识别错误：${error.message}`);
+        this.speechTracker.markIdle();
+        this.emitUpdate();
+      },
+    });
+
+    this.voiceSession = session;
+    this.voicePartial = "";
+    this.voicePartialCount = 0;
+    this.pushTimeline("voice_started", `语音输入已开启（task ${session.taskId}）`);
+    this.emitUpdate();
+
+    void session.finished
+      .catch(() => {
+        // 错误已通过 onError 汇报，这里只负责收尾
+      })
+      .finally(() => {
+        if (this.voiceSession === session) this.voiceSession = undefined;
+        this.speechTracker.markIdle();
+        this.voicePartial = "";
+        this.pushTimeline("voice_stopped", "语音输入已结束");
+        this.emitUpdate();
+      });
+
+    return session;
+  }
+
+  public get isListening(): boolean {
+    return this.voiceSession !== undefined;
+  }
+
+  /** 是否配置了 ASR（面板据此决定是否显示麦克风）。 */
+  public get voiceAvailable(): boolean {
+    return this.asr !== undefined;
+  }
+
+  /**
+   * 语音活动状态由**两个来源**合成：面板手动开关 + ASR 识别结果。
+   * 任一为真即视为「用户正在讲话」，语音交付让路。
+   */
+  private applySpeechState(): void {
+    const next = this.manualSpeechActive || this.vadSpeechActive;
+    if (this.speechActive === next) return;
+    this.speechActive = next;
+    this.pushTimeline("speech_activity", next ? "用户开始讲话：语音交付让路" : "用户停止讲话：恢复语音交付");
+
+    if (!next && this.deferredResults.length > 0) {
       const restored = this.deferredResults;
       this.deferredResults = [];
       this.pushTimeline("delivery_restored", `${restored.length} 条暂缓结果重新进入合并窗口`);
@@ -312,6 +448,8 @@ export class JarvisRuntime {
     for (const unsubscribe of this.unsubscribers) unsubscribe();
     this.batcher.dispose();
     this.transcript.dispose();
+    this.speechTracker.dispose();
+    this.voiceSession?.abort("运行时结束");
     this.delivery.dispose();
     this.audio.stop("演示结束");
     this.world.dispose();

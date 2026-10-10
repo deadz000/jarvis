@@ -9,11 +9,13 @@
  */
 import { join } from "node:path";
 
+import { DashScopeAsrAdapter } from "./adapters/dashscope/asr-adapter.ts";
 import { DashScopeTtsAdapter } from "./adapters/dashscope/tts-adapter.ts";
 import { DemoServer } from "./adapters/http/demo-server.ts";
 import { selectModel } from "./adapters/pi/model-selection.ts";
-import { JarvisRuntime } from "./application/runtime.ts";
+import { JarvisRuntime, ASR_SAMPLE_RATE } from "./application/runtime.ts";
 import type { TtsPort } from "./application/delivery/tts-port.ts";
+import type { AsrPort } from "./application/input/asr-port.ts";
 import { assertModelCredentials, ConfigError, describeConfig, loadConfig, type AppConfig } from "./config/env.ts";
 import { createLogger, type Logger } from "./observability/logger.ts";
 
@@ -142,6 +144,39 @@ function buildTtsAdapter(config: AppConfig, log: Logger): TtsPort | undefined {
 }
 
 /**
+ * 组合根：语音输入侧。与 TTS 同样的原则 —— 只有这里读密钥。
+ */
+function buildAsrAdapter(config: AppConfig, log: Logger): AsrPort | undefined {
+  const voice = config.voice;
+
+  if (!voice.enabled) return undefined;
+
+  const apiKey = process.env["DASHSCOPE_API_KEY"];
+  if (apiKey === undefined || voice.workspaceId === undefined || voice.asrModel === undefined) {
+    log.warn("app.asr.incomplete", {
+      missing: voice.missing,
+      hint: "ASR 配置不完整，面板将不显示麦克风",
+    });
+    return undefined;
+  }
+
+  log.info("app.asr.enabled", {
+    model: voice.asrModel,
+    region: voice.region,
+    sampleRate: ASR_SAMPLE_RATE,
+  });
+
+  return new DashScopeAsrAdapter({
+    apiKey,
+    workspaceId: voice.workspaceId,
+    model: voice.asrModel,
+    region: voice.region,
+    sampleRate: ASR_SAMPLE_RATE,
+    logger: log,
+  });
+}
+
+/**
  * 演示模式（Milestone Alpha）：启动可视化面板，把聊天 → Master → Scheduler →
  * 真实 Worker → 结果 → 交付队列 → 音频仲裁（模拟或真实 TTS）整条链路跑起来。
  */
@@ -154,11 +189,13 @@ async function runDemo(config: AppConfig, log: Logger): Promise<number> {
   });
 
   const tts = buildTtsAdapter(config, log);
+  const asr = buildAsrAdapter(config, log);
   const runtime = new JarvisRuntime({
     config,
     selected,
     logger: log,
     ...(tts === undefined ? {} : { tts }),
+    ...(asr === undefined ? {} : { asr }),
   });
   const rawPort = process.env["JARVIS_DEMO_PORT"];
   const port = rawPort === undefined ? DEFAULT_DEMO_PORT : Number(rawPort);

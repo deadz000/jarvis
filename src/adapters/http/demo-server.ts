@@ -14,6 +14,8 @@ import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
 
+import { WebSocketServer, type WebSocket } from "ws";
+
 import type { JarvisRuntime, RuntimeSnapshot } from "../../application/runtime.ts";
 import type { DeliveredAudioChunk } from "../../application/delivery/audio-manager.ts";
 import type { Logger } from "../../observability/logger.ts";
@@ -58,6 +60,7 @@ export class DemoServer {
   private readonly options: DemoServerOptions;
   private readonly sseClients = new Set<ServerResponse>();
   private server: Server | undefined;
+  private wss: WebSocketServer | undefined;
   private unsubscribeRuntime: (() => void) | undefined;
   private unsubscribeAudio: (() => void) | undefined;
   private heartbeat: NodeJS.Timeout | undefined;
@@ -72,6 +75,12 @@ export class DemoServer {
       void this.handle(request, response);
     });
     this.server = server;
+
+    // 语音上行：独立 WebSocket 通道（高频双向，不混进快照型 SSE）
+    this.wss = new WebSocketServer({ server, path: "/api/audio-in" });
+    this.wss.on("connection", (socket) => {
+      this.handleVoiceSocket(socket);
+    });
 
     this.unsubscribeRuntime = this.options.runtime.onUpdate((snapshot) => {
       this.broadcast(snapshot);
@@ -99,6 +108,15 @@ export class DemoServer {
   public async stop(): Promise<void> {
     this.unsubscribeRuntime?.();
     this.unsubscribeAudio?.();
+    await new Promise<void>((resolve) => {
+      if (this.wss === undefined) {
+        resolve();
+        return;
+      }
+      this.wss.close(() => {
+        resolve();
+      });
+    });
     if (this.heartbeat !== undefined) clearInterval(this.heartbeat);
     for (const client of this.sseClients) client.end();
     this.sseClients.clear();
@@ -199,6 +217,67 @@ export class DemoServer {
     response.on("close", () => {
       this.sseClients.delete(response);
     });
+  }
+
+  /**
+   * 语音上行通道：浏览器 → 服务端 → ASR。
+   *
+   * 为什么用**独立 WebSocket**而不是 SSE/HTTP：
+   * 音频是高频双向通道（上行约 100ms 一帧），混进快照型 SSE 会互相拖累 ——
+   * 这正是踩坑指南「高频通道必须独立」的落点。
+   */
+  private handleVoiceSocket(socket: WebSocket): void {
+    if (!this.options.runtime.voiceAvailable) {
+      socket.close(1008, "ASR 未配置");
+      return;
+    }
+
+    const session = this.options.runtime.startVoiceInput();
+    if (session === undefined) {
+      socket.close(1011, "无法开启语音输入");
+      return;
+    }
+
+    this.options.logger?.info("demo.voice_socket_open", { taskId: session.taskId });
+    let frames = 0;
+    let bytes = 0;
+
+    socket.on("message", (data: Buffer, isBinary: boolean) => {
+      if (!isBinary) {
+        try {
+          const message = JSON.parse(data.toString("utf8")) as { type?: string };
+          if (message.type === "stop") session.finish();
+        } catch {
+          // 忽略无法解析的控制消息
+        }
+        return;
+      }
+      frames += 1;
+      bytes += data.length;
+      session.push(Buffer.from(data));
+    });
+
+    socket.on("close", () => {
+      this.options.logger?.info("demo.voice_socket_close", { taskId: session.taskId, frames, bytes });
+      session.finish();
+    });
+
+    socket.on("error", (error: Error) => {
+      this.options.logger?.warn("demo.voice_socket_error", { taskId: session.taskId, error: error.message });
+      session.abort("socket 错误");
+    });
+
+    void session.finished
+      .catch(() => {
+        // 错误已经通过 runtime 的 onError 汇报
+      })
+      .finally(() => {
+        try {
+          socket.close(1000, "done");
+        } catch {
+          // 忽略重复关闭
+        }
+      });
   }
 
   private broadcast(snapshot: RuntimeSnapshot): void {
