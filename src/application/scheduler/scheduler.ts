@@ -22,9 +22,11 @@
  */
 import { assertTransition } from "../../domain/task/state-machine.ts";
 import {
+  DEFAULT_PRIORITY,
   isActiveTaskState,
   isTerminalTaskState,
   NO_RUN_GENERATION,
+  type Priority,
   type RunGeneration,
   type TaskId,
   type TaskRecord,
@@ -80,6 +82,8 @@ export interface CreateTaskRequest {
   readonly idempotencyKey?: string;
   /** 关联的 Master 决策 ID，仅用于可观测性。 */
   readonly decisionId?: string;
+  /** 记录用优先级；省略时为 normal。当前不影响准入顺序。 */
+  readonly priority?: Priority;
 }
 
 export type CreateTaskOutcome =
@@ -170,6 +174,7 @@ export class TaskScheduler {
       goal,
       state: "queued",
       runGeneration: NO_RUN_GENERATION,
+      priority: request.priority ?? DEFAULT_PRIORITY,
       createdAt: at,
       updatedAt: at,
       lastActivityAt: at,

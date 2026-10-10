@@ -14,6 +14,7 @@
     "example:abort": "node --env-file-if-exists=.env examples/sdk/02-abort-and-tools.ts",
     "example:workers": "node --env-file-if-exists=.env examples/sdk/03-two-workers.ts",
     "example:lifecycle": "node --env-file-if-exists=.env examples/sdk/04-session-lifecycle.ts",
+    "example:master": "node --env-file-if-exists=.env examples/sdk/05-master-decision.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

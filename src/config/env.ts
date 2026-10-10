@@ -46,6 +46,12 @@ export const DEFAULT_MODELS_RELATIVE_PATH = join("config", "models.json");
 /** 并发上限默认值：仅作为可配置项的初值，不是性能结论。 */
 export const DEFAULT_MAX_CONCURRENT_TASKS = 4;
 
+/**
+ * Master 决策超时。超时按降级策略处理：**不执行任何动作**，不猜测意图。
+ * 30s 是暂定值，必须按实测模型延迟重新标定（实施计划 M4：具体超时值基于模型实测配置）。
+ */
+export const DEFAULT_MASTER_TIMEOUT_MS = 30_000;
+
 export interface CredentialStatus {
   /** 检测到凭据的 provider 名（不含任何密钥内容）。 */
   readonly detectedProviders: readonly string[];
@@ -66,6 +72,8 @@ export interface AppConfig {
   readonly modelsPath: string | undefined;
   /** 并发执行上限。配置化，不沿用旧项目的硬编码值。 */
   readonly maxConcurrentTasks: number;
+  /** Master 决策超时（毫秒）；超时 → 空计划，不改动任何状态。 */
+  readonly masterTimeoutMs: number;
   readonly credentials: CredentialStatus;
 }
 
@@ -122,6 +130,16 @@ function parseModelsPath(env: NodeJS.ProcessEnv, workspace: string): string | un
   return existsSync(fallback) ? fallback : undefined;
 }
 
+function parseMasterTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const raw = readOptional(env, "JARVIS_MASTER_TIMEOUT_MS");
+  if (raw === undefined) return DEFAULT_MASTER_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new ConfigError(`JARVIS_MASTER_TIMEOUT_MS 必须是 >= 1 的整数，收到：${raw}`);
+  }
+  return parsed;
+}
+
 function detectCredentials(env: NodeJS.ProcessEnv, modelProvider: string | undefined): CredentialStatus {
   const detectedProviders: string[] = [];
   const detectedEnvVars: string[] = [];
@@ -157,6 +175,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     thinkingLevel: parseThinkingLevel(env),
     modelsPath: parseModelsPath(env, workspace),
     maxConcurrentTasks: parseMaxConcurrentTasks(env),
+    masterTimeoutMs: parseMasterTimeoutMs(env),
     credentials: detectCredentials(env, modelProvider),
   };
 }
@@ -176,6 +195,7 @@ export function describeConfig(config: AppConfig): Record<string, unknown> {
     thinkingLevel: config.thinkingLevel ?? null,
     modelsPath: config.modelsPath ?? null,
     maxConcurrentTasks: config.maxConcurrentTasks,
+    masterTimeoutMs: config.masterTimeoutMs,
     detectedProviders: config.credentials.detectedProviders,
     detectedEnvVars: config.credentials.detectedEnvVars,
   };

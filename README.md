@@ -16,7 +16,8 @@
 | **M1 单 Agent Runtime PoC** | ✅ 完成 | 事件生命周期、自定义工具闭环、`abort` 传递到工具层、`steer` 契约、重复请求/退订/dispose/会话持久化差异。ADR-001 §3.2 记录了三个实测陷阱 |
 | **M2 Worker Runtime Adapter** | ✅ 完成 | 真实 Pi Worker 适配器 + 确定性 FakeWorker。**真实 Session 并行重叠 1818ms、上下文隔离、取消隔离均已实测** |
 | **M3 确定性 Scheduler** | ✅ 完成 | 状态机 + 单写入口 + 代次隔离 + 取消竞态 + 并发准入 + 幂等键；24 项状态测试**不调用 LLM**。**未实现**：取消超时看门狗、优先级/饥饿防护 |
-| M4–M8 | ⬜ 未开始 | Master 决策面、结果交付、混合输入、持久化恢复、评测 |
+| **M4 Master 决策面** | ✅ 完成 | 两维版本号（eventSeq / controlRevision）、决策 Schema、解析与业务校验分离、逐动作前置条件校验、幂等键、超时降级为空计划。**真实 Master 端到端实测通过**（ADR-003） |
+| M5–M8 | ⬜ 未开始 | 结果交付与音频仲裁、混合输入、持久化恢复、评测 |
 
 **明确未实现（不要当成已具备）**：常驻事件接入、Master 决策、结果交付、音频仲裁、
 真实 Pi Worker 适配器、持久化与恢复。Scheduler 的**取消超时看门狗、优先级与饥饿防护**同样未实现。
@@ -83,6 +84,7 @@ npm run example:sdk -- "用一句话介绍这个仓库"
 | `npm run example:abort` | M1 实测：自定义工具闭环 + `abort` 是否传递到工具执行层 + `steer` 契约 |
 | `npm run example:workers` | M2 实测：真实双 Worker 并行重叠、上下文隔离、取消隔离 |
 | `npm run example:lifecycle` | M1 实测：重复请求、退订、`dispose` 语义、内存 vs 持久化会话 |
+| `npm run example:master` | M4 实测：真实 Master 产出结构化决策 → 逐动作校验 → 经 Scheduler 落地 |
 | `npm start` | 服务入口（M0 仅输出启动日志与未实现范围） |
 
 ---
@@ -97,11 +99,22 @@ src/
   domain/task/
     types.ts                      # TaskId / runGeneration / Task 状态与快照
     state-machine.ts              # 合法转移表（数据声明，可穷举测试）
+  domain/decision/types.ts        # MasterDecision 契约与两维版本号
   application/
     scheduler/scheduler.ts        # 确定性 Scheduler：唯一写入口、准入、取消、代次
     workers/ports.ts              # WorkerRuntime 端口（含取消与事件契约）
+    interaction/focus.ts          # 交互焦点（独立状态维度）
+    master/
+      context-view.ts             # 有界世界视图 + 两维版本号
+      decision-parser.ts          # 输出解析与 Schema 校验（不含业务规则）
+      decision-validator.ts       # 逐动作前置条件校验 → 编译为命令
+      decision-plane.ts           # 决策周期编排 + 超时降级
+      master-prompt.ts            # 提示词模板
   adapters/
     pi/session-outcome.ts         # Pi 终态判定（含 abort/取消的特殊性）
+    pi/pi-worker-runtime.ts       # 真实 Pi Worker 适配器
+    pi/pi-master.ts               # 真实 Pi Master 适配器（无工具，只出建议）
+    pi/model-selection.ts         # 模型选择
     workers/fake-worker.ts        # 确定性 FakeWorkerRuntime
 examples/sdk/
   01-minimal.ts                   # 最小 Session 示例

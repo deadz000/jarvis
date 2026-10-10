@@ -17,6 +17,18 @@ export type RunGeneration = number;
 /** 尚未开始执行时的代次。 */
 export const NO_RUN_GENERATION: RunGeneration = 0;
 
+/**
+ * 任务优先级（决策清单 C：现在只引入枚举与字段，**不启用抢占**）。
+ * 语义冻结与抢占条件属 M5 交付策略；当前仅作为记录与排序依据。
+ */
+export const PRIORITIES = ["low", "normal", "high", "urgent"] as const;
+export type Priority = (typeof PRIORITIES)[number];
+export const DEFAULT_PRIORITY: Priority = "normal";
+
+export function isPriority(value: unknown): value is Priority {
+  return typeof value === "string" && (PRIORITIES as readonly string[]).includes(value);
+}
+
 export const TASK_STATES = [
   "queued",
   "running",
@@ -51,6 +63,8 @@ export interface TaskRecord {
   readonly goal: string;
   readonly state: TaskState;
   readonly runGeneration: RunGeneration;
+  /** 记录用优先级。**当前不参与抢占或调度顺序**（FIFO 维持到 M8）。 */
+  readonly priority: Priority;
   readonly createdAt: number;
   readonly updatedAt: number;
   /** 最近一次与任务相关的活动时间，用于有界视图排序。 */
