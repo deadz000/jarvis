@@ -30,6 +30,15 @@ import { DeliveryBatcher, type PendingResult } from "./delivery/delivery-batcher
 import { DeliveryPolicy } from "./delivery/delivery-policy.ts";
 import { TranscriptCoalescer } from "./workers/transcript-coalescer.ts";
 import { SpeechActivityTracker } from "./interaction/speech-activity.ts";
+import { evaluateScreenIntent } from "./screen/screen-intent-gate.ts";
+import { ScreenMemory } from "./screen/screen-memory.ts";
+import { ScreenObserver, type ScreenObserverEvent } from "./screen/screen-observer.ts";
+import { ScreenChangeFilter, type ScreenFilterOptions } from "./screen/screen-filter.ts";
+import type {
+  ScreenCapturePort,
+  ScreenImagePort,
+  ScreenSummarizerPort,
+} from "./screen/screen-port.ts";
 import type { AsrPort, AsrSession } from "./input/asr-port.ts";
 import { SimulatedAudioManager, type AudioEvent, type AudioStats, type DeliveredAudioChunk } from "./delivery/audio-manager.ts";
 import type { TtsPort } from "./delivery/tts-port.ts";
@@ -110,6 +119,16 @@ export interface RuntimeSnapshot {
     /** 最近一次识别的终稿。 */
     readonly lastFinal: string | null;
   };
+  /** 屏幕观察状态。 */
+  readonly screen: {
+    readonly available: boolean;
+    readonly enabled: boolean;
+    /** 10 分钟滑动窗口内的摘要条数。 */
+    readonly memoryCount: number;
+    readonly lastSummary: string | null;
+    /** 最近一次意图门控的判断结果（让"零成本"这条主张可观测）。 */
+    readonly lastGateDecision: string | null;
+  };
 }
 
 export interface JarvisRuntimeOptions {
@@ -126,6 +145,24 @@ export interface JarvisRuntimeOptions {
    * 真实 ASR 端口。提供则语音输入可用；省略则面板不显示麦克风。
    */
   readonly asr?: AsrPort;
+  /**
+   * 屏幕观察端口组。提供则屏幕观察可用（默认仍关闭，需显式开启）。
+   */
+  readonly screen?: ScreenWiringOptions;
+}
+
+/** 屏幕观察的端口组（由组合根构造，运行时负责编排与状态）。 */
+export interface ScreenWiringOptions {
+  readonly capture: ScreenCapturePort;
+  readonly image: ScreenImagePort;
+  readonly summarizer: ScreenSummarizerPort;
+  readonly pollIntervalMs?: number;
+  /**
+   * 过滤阈值覆盖。
+   * 默认值是产品负责人确认的规格（汉明 ≥8、色块 ≥25%、节流 5s），
+   * 但这些是**未经验证的启发式**，需要可按环境调整以便 M8 重新标定。
+   */
+  readonly filterOptions?: ScreenFilterOptions;
 }
 
 export const DEFAULT_MAX_TIMELINE_ENTRIES = 200;
@@ -156,6 +193,11 @@ export class JarvisRuntime {
     },
   });
   private readonly asr: AsrPort | undefined;
+  private readonly screenMemory = new ScreenMemory();
+  private readonly screenObserver: ScreenObserver | undefined;
+  private screenEnabled = false;
+  private lastScreenSummary: string | null = null;
+  private lastScreenGateDecision: string | null = null;
   /** 识别结果驱动的语音活动（驱动交付让路）。 */
   private readonly speechTracker = new SpeechActivityTracker({
     onActive: () => {
@@ -221,6 +263,26 @@ export class JarvisRuntime {
     });
 
     this.asr = options.asr;
+
+    this.screenObserver =
+      options.screen === undefined
+        ? undefined
+        : new ScreenObserver({
+            capture: options.screen.capture,
+            image: options.screen.image,
+            summarizer: options.screen.summarizer,
+            memory: this.screenMemory,
+            ...(options.screen.filterOptions === undefined
+              ? {}
+              : { filter: new ScreenChangeFilter(options.screen.filterOptions) }),
+            ...(options.screen.pollIntervalMs === undefined
+              ? {}
+              : { pollIntervalMs: options.screen.pollIntervalMs }),
+            ...(options.logger === undefined ? {} : { logger: options.logger }),
+            onEvent: (event) => {
+              this.onScreenEvent(event);
+            },
+          });
     this.delivery = new DeliveryQueue({ audio: this.audio });
 
     this.plane = new MasterDecisionPlane({
@@ -256,14 +318,95 @@ export class JarvisRuntime {
     // 一个用户 turn 只记一次（避免一次输入被重复记账）
     this.dialogue.appendUserTurn(text);
     this.pushTimeline("user_input", text);
+
+    /**
+     * 意图门控：**纯文字指令不注入任何屏幕内容**（零 token 成本）。
+     * 这里刻意用确定性启发式而不是让模型判断 —— 后者必须先注入上下文才能判断，
+     * 那就已经产生了成本，自相矛盾。
+     */
+    const intent = evaluateScreenIntent(text);
+    const view = this.screenMemory.view(Date.now());
+    const includeScreen = intent.include && view.summaries.length > 0;
+
+    this.lastScreenGateDecision = !intent.include
+      ? intent.reason
+      : includeScreen
+        ? `注入 ${String(view.summaries.length)} 条屏幕摘要（${intent.reason}）`
+        : `门控通过但暂无可用摘要（${intent.reason}）`;
+    this.pushTimeline("screen_gate", this.lastScreenGateDecision);
+
     this.emitUpdate();
 
-    const result = await this.plane.decide({ userInput: text });
+    const result = await this.plane.decide({
+      userInput: text,
+      ...(includeScreen
+        ? { screen: { summaries: view.summaries, oldestAt: view.oldestAt } }
+        : {}),
+    });
     this.lastDecision = toDecisionView(result);
     this.dialogue.appendSystem(`调度决策：${describeDecision(this.lastDecision)}`);
     this.pushTimeline("decision", describeDecision(this.lastDecision));
     this.emitUpdate();
     return this.lastDecision;
+  }
+
+  /**
+   * 屏幕观察开关。**默认关闭**，必须显式开启。
+   *
+   * 关闭时 `ScreenObserver.stop()` 会丢弃未满批的帧（关闭即不留残余）；
+   * 已经进入滑动窗口的摘要保留 —— 那是历史，不因采集开关而改写。
+   */
+  public setScreenEnabled(enabled: boolean): void {
+    if (this.screenObserver === undefined) {
+      this.logger?.warn("runtime.screen_unavailable", { hint: "未配置屏幕采集端口" });
+      return;
+    }
+    if (this.screenEnabled === enabled) return;
+    this.screenEnabled = enabled;
+    if (enabled) this.screenObserver.start();
+    else this.screenObserver.stop();
+    this.emitUpdate();
+  }
+
+  public get screenAvailable(): boolean {
+    return this.screenObserver !== undefined;
+  }
+
+  private onScreenEvent(event: ScreenObserverEvent): void {
+    switch (event.type) {
+      case "screen_started":
+        this.pushTimeline("screen_started", "屏幕观察已开启（5s 节流 · 双条件过滤 · 帧不落盘）");
+        break;
+      case "screen_stopped":
+        this.pushTimeline("screen_stopped", "屏幕观察已关闭（未满批的帧已丢弃）");
+        break;
+      case "screen_frame_admitted":
+        this.pushTimeline(
+          "screen_changed",
+          `屏幕发生有意义变化：指纹 ${event.fingerprintHex}，汉明 ${String(event.hammingDistance ?? "n/a")}，` +
+            `色块 ${event.blockChangeRatio === null ? "n/a" : `${(event.blockChangeRatio * 100).toFixed(1)}%`}`,
+        );
+        break;
+      case "screen_batch_ready":
+        this.pushTimeline("screen_batch", `${String(event.frameCount)} 帧出批，准备多模态摘要`);
+        break;
+      case "screen_summarized":
+        this.lastScreenSummary = event.text;
+        this.pushTimeline(
+          "screen_summary",
+          `${event.fromModel ? "模型" : "确定性兜底"}摘要：${event.text}`,
+        );
+        break;
+      case "screen_error":
+        this.logger?.warn("runtime.screen_error", { error: event.error });
+        this.pushTimeline("screen_error", `屏幕采集错误：${event.error}`);
+        break;
+      // 被拒绝的帧是常态（每 5s 都可能发生），不记时间线以免淹没真实事件
+      case "screen_frame_skipped":
+      case "screen_busy_skipped":
+        return;
+    }
+    this.emitUpdate();
   }
 
   /** 面板上的取消按钮：这是用户的**直接**指令，因此不再经 Master 推断，直接交给 Scheduler。 */
@@ -322,6 +465,13 @@ export class JarvisRuntime {
         partial: this.voicePartial,
         partialCount: this.voicePartialCount,
         lastFinal: this.voiceLastFinal,
+      },
+      screen: {
+        available: this.screenObserver !== undefined,
+        enabled: this.screenEnabled,
+        memoryCount: this.screenMemory.size(),
+        lastSummary: this.lastScreenSummary,
+        lastGateDecision: this.lastScreenGateDecision,
       },
     };
   }
@@ -450,6 +600,7 @@ export class JarvisRuntime {
     this.transcript.dispose();
     this.speechTracker.dispose();
     this.voiceSession?.abort("运行时结束");
+    this.screenObserver?.stop();
     this.delivery.dispose();
     this.audio.stop("演示结束");
     this.world.dispose();

@@ -14,6 +14,7 @@
  * 只陈述可确定的事实（这一批有几帧、分辨率、观测时段），并明确标注未得到内容摘要。
  */
 import type { Logger } from "../../observability/logger.ts";
+import { deterministicScreenSummary } from "../../application/screen/deterministic-summary.ts";
 import type {
   ScreenSummarizeInput,
   ScreenSummarizerPort,
@@ -171,8 +172,11 @@ export class OpenAiResponsesVisionSummarizer implements ScreenSummarizerPort {
 }
 
 /**
- * 确定性兜底摘要：只说能确定的事实，并**明确标注这是兜底**，
- * 让调用方（和用户）不会把"摘要失败"误读为"屏幕无内容"。
+ * 确定性兜底摘要：只说能确定的事实，并**明确标注这是兜底**。
+ *
+ * 实际逻辑在应用层（`application/screen/deterministic-summary.ts`）——
+ * 那是纯逻辑，不该放在厂商适配器里。这里保留一个薄包装，
+ * 方便 `FallbackScreenSummarizer` 以端口形式使用。
  */
 export class DeterministicScreenSummarizer implements ScreenSummarizerPort {
   private readonly now: () => number;
@@ -182,22 +186,7 @@ export class DeterministicScreenSummarizer implements ScreenSummarizerPort {
   }
 
   public summarize(input: ScreenSummarizeInput): Promise<ScreenSummary> {
-    const first = input.frames[0];
-    const last = input.frames[input.frames.length - 1];
-    const size = first === undefined ? "未知" : `${String(first.width)}x${String(first.height)}`;
-    const spanMs =
-      first !== undefined && last !== undefined ? Math.max(0, last.capturedAt - first.capturedAt) : 0;
-
-    return Promise.resolve({
-      text: truncate(
-        `屏幕在约 ${(spanMs / 1000).toFixed(0)} 秒内发生了 ${input.frames.length} 次明显变化（分辨率 ${size}），` +
-          "但内容摘要未能生成（模型调用失败）。",
-        MAX_SCREEN_SUMMARY_LENGTH,
-      ),
-      at: this.now(),
-      frameCount: input.frames.length,
-      fromModel: false,
-    });
+    return Promise.resolve(deterministicScreenSummary(input.frames, this.now()));
   }
 }
 

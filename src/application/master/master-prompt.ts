@@ -46,6 +46,11 @@ export interface MasterPromptRequest {
   readonly view: MasterContextView;
   readonly dialogue: readonly DialogueEntry[];
   readonly pendingResults: readonly PendingResult[];
+  /**
+   * 屏幕上下文（**仅摘要**）。
+   * 只在意图门控命中时才有值 —— 纯文字指令不会带上任何屏幕内容。
+   */
+  readonly screen?: { readonly summaries: readonly string[]; readonly oldestAt: number | null };
 }
 
 function renderDialogue(dialogue: readonly DialogueEntry[]): string {
@@ -53,6 +58,28 @@ function renderDialogue(dialogue: readonly DialogueEntry[]): string {
   return dialogue
     .map((entry) => `${entry.role === "user" ? "用户" : "系统"}：${entry.text}`)
     .join("\n");
+}
+
+/**
+ * 渲染屏幕上下文。
+ *
+ * 两条约束写进提示词本身：
+ * 1. **不含原始帧**（这里只有摘要文本）；
+ * 2. 摘要是**滞后**的，不得当成实时事实 —— SRS 要求「历史信息可追溯来源、
+ *    不会冒充实时事实」。用户问"现在屏幕上是什么"时，模型应当说明这是观察摘要，
+ *    必要时建议重新观察，而不是假装自己正在看。
+ */
+function renderScreen(screen: MasterPromptRequest["screen"]): string {
+  if (screen === undefined || screen.summaries.length === 0) {
+    return "（未提供屏幕上下文）";
+  }
+  const lines = screen.summaries.map((summary, index) => `${index + 1}. ${summary}`);
+  return [
+    ...lines,
+    "",
+    "注意：以上是**间隔观察得到的摘要**（有滞后），不是实时画面。",
+    "不要把它当成此刻正在发生的事实；需要当前画面时应先去获取，而不是假设。",
+  ].join("\n");
 }
 
 export function buildMasterPrompt(request: MasterPromptRequest): string {
@@ -115,6 +142,9 @@ export function buildMasterPrompt(request: MasterPromptRequest): string {
     "",
     "## 最近的对话历史",
     renderDialogue(request.dialogue),
+    "",
+    "## 最近的屏幕观察",
+    renderScreen(request.screen),
     "",
     "## 输出格式",
     "```json",

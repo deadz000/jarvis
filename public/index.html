@@ -139,6 +139,11 @@
     </div>
     <div id="transcript" class="transcript" style="display:none"></div>
     <div class="row">
+      <button id="screen" class="ghost" disabled>👁 开启屏幕观察</button>
+      <span class="sub" id="screen-state">屏幕观察：未就绪</span>
+    </div>
+    <div id="screen-info" class="transcript" style="display:none"></div>
+    <div class="row">
       <button id="speech" class="ghost">模拟用户正在讲话</button>
       <span class="sub" id="speech-state">语音交付：可交付</span>
     </div>
@@ -426,6 +431,33 @@ async function stopVoice() {
 
 el("mic").onclick = () => { if (micActive) void stopVoice(); else void startVoice(); };
 
+// ---------- 屏幕观察开关 ----------
+let screenEnabled = false;
+el("screen").onclick = () => post("/api/screen", { enabled: !screenEnabled });
+
+function renderScreen(screen) {
+  const available = screen !== undefined && screen.available === true;
+  screenEnabled = screen !== undefined && screen.enabled === true;
+
+  el("screen").disabled = !available;
+  el("screen").textContent = !available
+    ? "👁 屏幕观察不可用"
+    : screenEnabled ? "⏹ 关闭屏幕观察" : "👁 开启屏幕观察";
+  el("screen-state").textContent = !available
+    ? "屏幕观察：不可用（未配置或非 Windows）"
+    : screenEnabled
+      ? "屏幕观察：运行中（窗口内 " + screen.memoryCount + " 条摘要）"
+      : "屏幕观察：已关闭";
+
+  const box = el("screen-info");
+  const summary = screen && screen.lastSummary ? screen.lastSummary : "";
+  const gate = screen && screen.lastGateDecision ? screen.lastGateDecision : "";
+  if (!summary && !gate) { box.style.display = "none"; return; }
+  box.style.display = "block";
+  box.innerHTML = (summary ? '<div class="final">👁 ' + esc(summary) + "</div>" : "")
+    + (gate ? '<div class="partial">意图门控：' + esc(gate) + "</div>" : "");
+}
+
 function renderVoice(voice) {
   const available = voice !== undefined && voice.available === true;
   el("mic").disabled = !available;
@@ -563,6 +595,7 @@ function render(snapshot) {
   el("speech-state").textContent = speechActive ? "语音交付：让路（面板照常更新）" : "语音交付：可交付";
   el("speech").textContent = speechActive ? "模拟用户停止讲话" : "模拟用户正在讲话";
   renderVoice(snapshot.voice);
+  renderScreen(snapshot.screen);
   renderTasks(snapshot.tasks);
   renderDeliveries(snapshot.deliveries);
   renderAudio(snapshot.audio);

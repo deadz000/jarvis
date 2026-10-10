@@ -7,16 +7,32 @@
  *
  * 依据：开发实施计划 §3（M0 交付物）、§9（首版不做清单）。
  */
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { DashScopeAsrAdapter } from "./adapters/dashscope/asr-adapter.ts";
 import { DashScopeTtsAdapter } from "./adapters/dashscope/tts-adapter.ts";
 import { DemoServer } from "./adapters/http/demo-server.ts";
 import { selectModel } from "./adapters/pi/model-selection.ts";
-import { JarvisRuntime, ASR_SAMPLE_RATE } from "./application/runtime.ts";
+import {
+  DeterministicScreenSummarizer,
+  FallbackScreenSummarizer,
+  OpenAiResponsesVisionSummarizer,
+} from "./adapters/vision/openai-responses-vision-summarizer.ts";
+import { WindowsScreenCapture } from "./adapters/windows/windows-screen-capture.ts";
+import { WindowsScreenImage } from "./adapters/windows/windows-screen-image.ts";
+import type { ScreenFilterOptions } from "./application/screen/screen-filter.ts";
+import { JarvisRuntime, ASR_SAMPLE_RATE, type ScreenWiringOptions } from "./application/runtime.ts";
 import type { TtsPort } from "./application/delivery/tts-port.ts";
 import type { AsrPort } from "./application/input/asr-port.ts";
-import { assertModelCredentials, ConfigError, describeConfig, loadConfig, type AppConfig } from "./config/env.ts";
+import {
+  assertModelCredentials,
+  ConfigError,
+  DEFAULT_MODELS_RELATIVE_PATH,
+  describeConfig,
+  loadConfig,
+  type AppConfig,
+} from "./config/env.ts";
 import { createLogger, type Logger } from "./observability/logger.ts";
 
 const CHECK_FLAG = "--check";
@@ -176,6 +192,121 @@ function buildAsrAdapter(config: AppConfig, log: Logger): AsrPort | undefined {
   });
 }
 
+/** 从 models.json 读取 provider 的 baseUrl（摘要走 OpenAI 兼容端点，需要它）。 */
+function readProviderBaseUrl(config: AppConfig): string | undefined {
+  interface ModelsFile {
+    readonly providers?: Record<string, { readonly baseUrl?: string }>;
+  }
+  try {
+    const raw = readFileSync(
+      join(config.workspace, config.modelsPath ?? DEFAULT_MODELS_RELATIVE_PATH),
+      "utf8",
+    );
+    const parsed = JSON.parse(raw) as ModelsFile;
+    if (config.modelProvider === undefined) return undefined;
+    return parsed.providers?.[config.modelProvider]?.baseUrl;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 组合根：屏幕观察。
+ *
+ * **默认关闭** —— 这里只负责把端口装好并报告可用性，是否开启由用户显式决定
+ * （面板开关 / `POST /api/screen`）。
+ */
+function buildScreenWiring(config: AppConfig, log: Logger): ScreenWiringOptions | undefined {
+  if (process.platform !== "win32") {
+    log.info("app.screen.unsupported", { platform: process.platform });
+    return undefined;
+  }
+
+  const apiKey = process.env["JARVIS_MODEL_API_KEY"];
+  const baseUrl = readProviderBaseUrl(config);
+  const screenOverrides = readScreenOverrides();
+  const pollMs = readScreenPollMs();
+  if (apiKey === undefined || baseUrl === undefined || config.modelId === undefined) {
+    log.warn("app.screen.unavailable", {
+      hint: "无法确定多模态摘要所需的端点/密钥/模型，屏幕观察不可用",
+      hasKey: apiKey !== undefined,
+      hasBaseUrl: baseUrl !== undefined,
+      hasModelId: config.modelId !== undefined,
+    });
+    return undefined;
+  }
+
+  log.info("app.screen.available", {
+    baseUrl,
+    model: config.modelId,
+    thresholdsOverridden: screenOverrides ?? null,
+    pollIntervalMs: pollMs ?? null,
+    note: "默认关闭，需显式开启；摘要会把一张约 35KB 的 JPEG 发送给模型",
+  });
+
+  return {
+    capture: new WindowsScreenCapture(config.workspace, { logger: log }),
+    image: new WindowsScreenImage(config.workspace, { logger: log }),
+    summarizer: new FallbackScreenSummarizer(
+      new OpenAiResponsesVisionSummarizer({
+        baseUrl,
+        apiKey,
+        model: config.modelId,
+        logger: log,
+      }),
+      new DeterministicScreenSummarizer(),
+      log,
+    ),
+    ...(screenOverrides === undefined ? {} : { filterOptions: screenOverrides }),
+    ...(pollMs === undefined ? {} : { pollIntervalMs: pollMs }),
+  };
+}
+
+/**
+ * 屏幕过滤阈值的环境覆盖。
+ *
+ * 默认值是产品负责人确认的规格（汉明 ≥8 / 色块 ≥25% / 节流 5s）。
+ * 允许覆盖有两个正当理由：
+ * 1. 这些是**未经验证的启发式**，M8 需要用真实数据重新标定；
+ * 2. 验证摘要链路时需要临时放宽阈值（静止画面永远不会触发双条件）。
+ */
+function readScreenOverrides(): ScreenFilterOptions | undefined {
+  const overrides: {
+    minHammingDistance?: number;
+    minBlockChangeRatio?: number;
+    throttleMs?: number;
+  } = {};
+
+  const hamming = Number(process.env["JARVIS_SCREEN_MIN_HAMMING"]);
+  const hammingRaw = process.env["JARVIS_SCREEN_MIN_HAMMING"];
+  if (hammingRaw !== undefined && Number.isFinite(hamming) && hamming >= 0) {
+    overrides.minHammingDistance = hamming;
+  }
+
+  const ratioRaw = process.env["JARVIS_SCREEN_MIN_BLOCK_RATIO"];
+  const ratio = Number(ratioRaw);
+  if (ratioRaw !== undefined && Number.isFinite(ratio) && ratio >= 0 && ratio <= 1) {
+    overrides.minBlockChangeRatio = ratio;
+  }
+
+  const throttleRaw = process.env["JARVIS_SCREEN_THROTTLE_MS"];
+  const throttle = Number(throttleRaw);
+  if (throttleRaw !== undefined && Number.isFinite(throttle) && throttle >= 0) {
+    overrides.throttleMs = throttle;
+  }
+
+  return Object.keys(overrides).length === 0 ? undefined : overrides;
+}
+
+/** 屏幕轮询间隔的环境覆盖（M8 调参用；默认与节流一致 5s）。 */
+function readScreenPollMs(): number | undefined {
+  const raw = process.env["JARVIS_SCREEN_POLL_MS"];
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 100) return undefined;
+  return value;
+}
+
 /**
  * 演示模式（Milestone Alpha）：启动可视化面板，把聊天 → Master → Scheduler →
  * 真实 Worker → 结果 → 交付队列 → 音频仲裁（模拟或真实 TTS）整条链路跑起来。
@@ -190,12 +321,14 @@ async function runDemo(config: AppConfig, log: Logger): Promise<number> {
 
   const tts = buildTtsAdapter(config, log);
   const asr = buildAsrAdapter(config, log);
+  const screen = buildScreenWiring(config, log);
   const runtime = new JarvisRuntime({
     config,
     selected,
     logger: log,
     ...(tts === undefined ? {} : { tts }),
     ...(asr === undefined ? {} : { asr }),
+    ...(screen === undefined ? {} : { screen }),
   });
   const rawPort = process.env["JARVIS_DEMO_PORT"];
   const port = rawPort === undefined ? DEFAULT_DEMO_PORT : Number(rawPort);

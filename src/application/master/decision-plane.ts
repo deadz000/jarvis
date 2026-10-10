@@ -38,8 +38,21 @@ export interface MasterRequest {
   readonly dialogue: readonly DialogueEntry[];
   /** 本批待交付结果（仅 delivery 模式非空）。 */
   readonly pendingResults: readonly PendingResult[];
+  /**
+   * 屏幕上下文（**仅摘要**，绝不含帧）。
+   *
+   * 只在意图门控命中时才由调用方传入 —— 纯文字指令不带任何屏幕内容，
+   * 因此那类调用的屏幕 token 成本为 0。
+   */
+  readonly screen?: ScreenPromptContext;
   /** 超时或取消时用于中止模型调用，避免遗留运行中的 Session。 */
   readonly signal?: AbortSignal;
+}
+
+/** 送给 Master 的屏幕上下文（有界、只有文本）。 */
+export interface ScreenPromptContext {
+  readonly summaries: readonly string[];
+  readonly oldestAt: number | null;
 }
 
 export type MasterProposal =
@@ -137,9 +150,18 @@ export class MasterDecisionPlane {
    * `userInput` 会先计入 `eventSeq`（事件完整性），再构造快照。
    */
   public async decide(
-    input: { readonly userInput?: string; readonly source?: string } = {},
+    input: {
+      readonly userInput?: string;
+      readonly source?: string;
+      readonly screen?: ScreenPromptContext;
+    } = {},
   ): Promise<DecisionCycleResult> {
-    return this.runCycle({ mode: "intent", pendingResults: [], input });
+    return this.runCycle({
+      mode: "intent",
+      pendingResults: [],
+      input,
+      ...(input.screen === undefined ? {} : { screen: input.screen }),
+    });
   }
 
   /**
@@ -161,6 +183,7 @@ export class MasterDecisionPlane {
     readonly mode: "intent" | "delivery";
     readonly pendingResults: readonly PendingResult[];
     readonly input: { readonly userInput?: string; readonly source?: string };
+    readonly screen?: ScreenPromptContext;
   }): Promise<DecisionCycleResult> {
     const input = run.input;
     if (input.userInput !== undefined) {
@@ -180,6 +203,7 @@ export class MasterDecisionPlane {
           view,
           dialogue: this.dialogueEntries(),
           pendingResults: run.pendingResults,
+          ...(run.screen === undefined ? {} : { screen: run.screen }),
           signal: controller.signal,
         }),
         this.timeoutMs,

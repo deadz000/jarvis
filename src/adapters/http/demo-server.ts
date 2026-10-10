@@ -177,6 +177,18 @@ export class DemoServer {
         return;
       }
 
+      if (request.method === "POST" && path === "/api/screen") {
+        const body = await readJsonBody(request);
+        const enabled = body["enabled"] === true;
+        this.options.runtime.setScreenEnabled(enabled);
+        sendJson(response, 200, {
+          ok: true,
+          enabled,
+          available: this.options.runtime.screenAvailable,
+        });
+        return;
+      }
+
       if (request.method === "POST" && path === "/api/speech") {
         const body = await readJsonBody(request);
         const active = body["active"] === true;
