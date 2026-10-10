@@ -18,6 +18,7 @@ sessions/
 *.session.jsonl
 logs/
 *.log
+.tmp/
 
 # 测试与工具
 coverage/

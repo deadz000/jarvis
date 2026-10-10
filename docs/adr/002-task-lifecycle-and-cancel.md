@@ -114,7 +114,7 @@ succeeded | failed | cancelled → （无）
 | 优先级与饥饿防护 | **未实现**。只有 FIFO + 并发上限，无优先级、无抢占、无饥饿保护（SRS 待决策项 3） |
 | 结果持久化与交付 | **未实现**（M5）。`resultSummary` 只在内存 |
 | Master 决策校验 | **未实现**（M4）。Scheduler 目前接受直接命令，逐动作校验与 revision 校验尚未建立 |
-| 真实 Pi Worker | **未接入**。M2 端口已定义并有 FakeWorker 测试；真实适配器需在 M2 后半段实现 |
+| 真实 Pi Worker | ✅ **已接入**（`src/adapters/pi/pi-worker-runtime.ts`）：真实 Session 的并行重叠、上下文隔离与取消隔离均已实测。未验证：多轮工具循环中的取消确认时点 |
 
 ---
 

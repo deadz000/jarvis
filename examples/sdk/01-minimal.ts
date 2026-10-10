@@ -15,8 +15,9 @@
  * 用法：npm run example:sdk -- "你的问题"
  * 前置：.env 中至少配置一个 provider 的 API Key。
  */
-import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 
+import { selectModel } from "../../src/adapters/pi/model-selection.ts";
 import {
   classifySessionOutcome,
   readAssistantFinalMessage,
@@ -31,45 +32,20 @@ async function run(): Promise<void> {
 
   assertModelCredentials(config);
 
-  const modelRuntime = await ModelRuntime.create(
-    config.modelsPath === undefined ? {} : { modelsPath: config.modelsPath },
-  );
-  const available = await modelRuntime.getAvailable();
-  const availableLabel = available.map((model) => `${model.provider}/${model.id}`).join(", ") || "（无）";
-
-  function resolveModel(): (typeof available)[number] {
-    if (config.modelProvider !== undefined && config.modelId !== undefined) {
-      const pinned = modelRuntime.getModel(config.modelProvider, config.modelId);
-      if (pinned === undefined) {
-        throw new ConfigError(
-          `找不到模型 ${config.modelProvider}/${config.modelId}；当前有凭据的可用模型：${availableLabel}`,
-        );
-      }
-      return pinned;
-    }
-    const first = available[0];
-    if (first === undefined) {
-      throw new ConfigError(
-        "没有检测到任何「有凭据」的可用模型。请检查 .env 中的 provider API Key，或显式设置 JARVIS_MODEL_PROVIDER / JARVIS_MODEL_ID。",
-      );
-    }
-    return first;
-  }
-
-  const model = resolveModel();
+  const selected = await selectModel(config);
   log.info("example.model.selected", {
-    model: `${model.provider}/${model.id}`,
-    pinned: config.modelProvider !== undefined,
-    availableCount: available.length,
-    available: availableLabel,
+    model: `${selected.model.provider}/${selected.model.id}`,
+    pinned: selected.pinned,
+    availableCount: selected.availableCount,
+    available: selected.availableLabel,
   });
 
   const prompt = process.argv.slice(2).join(" ").trim() || "用一句话确认你已就绪。";
 
   const { session } = await createAgentSession({
     cwd: config.workspace,
-    modelRuntime,
-    model,
+    modelRuntime: selected.modelRuntime,
+    model: selected.model,
     sessionManager: SessionManager.inMemory(config.workspace),
     ...(config.thinkingLevel === undefined ? {} : { thinkingLevel: config.thinkingLevel }),
   });

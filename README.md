@@ -13,9 +13,9 @@
 | 里程碑 | 状态 | 说明 |
 |---|---|---|
 | **M0 项目初始化与 SDK 核验** | ✅ 完成 | 工程骨架、锁定依赖、配置/日志、ADR-001、最小 Session 示例；真实模型调用已实测通过 |
-| **M1 单 Agent Runtime PoC** | 🟡 核心已验证 | 已实测：事件生命周期、自定义工具闭环、`abort` 传递到工具层、`steer` 契约。**未验证**：多轮工具循环的取消确认时点、超时清理、会话持久化差异 |
-| **M2 Worker Runtime Adapter** | 🟡 端口已定 | `WorkerRuntime` 端口 + `FakeWorkerRuntime`（确定性、显式驱动）；事件携带 `taskId`/`runGeneration`。**真实 Pi 适配器未实现** |
-| **M3 确定性 Scheduler** | 🟡 核心已实现 | 状态机 + 单写入口 + 代次隔离 + 取消竞态 + 并发准入 + 幂等键；24 项状态测试**不调用 LLM**。**未实现**：取消超时看门狗、优先级/饥饿防护 |
+| **M1 单 Agent Runtime PoC** | ✅ 完成 | 事件生命周期、自定义工具闭环、`abort` 传递到工具层、`steer` 契约、重复请求/退订/dispose/会话持久化差异。ADR-001 §3.2 记录了三个实测陷阱 |
+| **M2 Worker Runtime Adapter** | ✅ 完成 | 真实 Pi Worker 适配器 + 确定性 FakeWorker。**真实 Session 并行重叠 1818ms、上下文隔离、取消隔离均已实测** |
+| **M3 确定性 Scheduler** | ✅ 完成 | 状态机 + 单写入口 + 代次隔离 + 取消竞态 + 并发准入 + 幂等键；24 项状态测试**不调用 LLM**。**未实现**：取消超时看门狗、优先级/饥饿防护 |
 | M4–M8 | ⬜ 未开始 | Master 决策面、结果交付、混合输入、持久化恢复、评测 |
 
 **明确未实现（不要当成已具备）**：常驻事件接入、Master 决策、结果交付、音频仲裁、
@@ -81,6 +81,8 @@ npm run example:sdk -- "用一句话介绍这个仓库"
 | `npm run typecheck` | `tsc --noEmit` 全量类型检查 |
 | `npm run example:sdk -- "<问题>"` | 最小 Session 示例：创建 → 订阅流式事件 → 单轮 prompt → 释放 |
 | `npm run example:abort` | M1 实测：自定义工具闭环 + `abort` 是否传递到工具执行层 + `steer` 契约 |
+| `npm run example:workers` | M2 实测：真实双 Worker 并行重叠、上下文隔离、取消隔离 |
+| `npm run example:lifecycle` | M1 实测：重复请求、退订、`dispose` 语义、内存 vs 持久化会话 |
 | `npm start` | 服务入口（M0 仅输出启动日志与未实现范围） |
 
 ---

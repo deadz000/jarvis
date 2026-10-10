@@ -127,6 +127,26 @@ agent_start → turn_start → message_start/message_end ×3 → turn_end → ag
 而若最终仍正常产出正文并正常收尾，则判定为 `succeeded`（取消输给了完成）。
 这直接对应 Scheduler 的取消竞态处理（见 ADR-002 §2.4）。
 
+### 3.2.3 实机验证：`dispose()` 之后 `prompt()` 仍会静默 resolve（又一个「resolve ≠ 完成」）
+
+`npm run example:lifecycle` 实测：
+
+- `session.dispose()` 之后再次调用 `prompt()`：**不抛错、正常 resolve**，但**不产生任何新事件、也不产生新的 assistant 消息**；
+- 此时 `getLastAssistantText()` **返回的是上一轮的历史文本**（实测返回了上一个问题的答案）。
+  直接拿它当结果，就会把**陈旧文本**当成新结果汇报 —— 与 §3.2.1 同族陷阱。
+- 本项目的处理：终态判定只看**本次运行**捕获到的 `message_end` 消息，不看 `getLastAssistantText()`。
+  因此该场景被判为 `unverified`，再由 Worker 适配器映射为 `worker_failed`，**不会误报成功**。
+
+配套的生命周期实测结论：
+
+| 检查项 | 结果 |
+|---|---|
+| 同一 Session 重复请求（连续两次 prompt） | ✅ 两次都 `succeeded`，历史正常累积 |
+| 退订后是否仍收到事件 | ✅ 事件计数停止增长（无监听器泄漏） |
+| `dispose()` 后是否还能产出成功结果 | ✅ 否（判为 `unverified`） |
+| `SessionManager.inMemory()` 是否落盘 | ✅ 否，`getSessionFile()` 为 `undefined` |
+| `SessionManager.create(cwd, sessionDir)` 是否落盘 | ✅ 是，实测写出 8007 字节 `.jsonl` |
+
 ### 3.3 凭据与配置来源
 
 - provider 凭据来自进程环境变量（Pi `docs/providers.md`）：
@@ -186,7 +206,9 @@ agent_start → turn_start → message_start/message_end ×3 → turn_end → ag
 | 凭据缺失路径 | ✅ 输出可读的 `[example-error]` 提示，exit 1，无裸栈 |
 | 真实模型调用（`cf-fan/deepseek-flash`） | ✅ 8956ms 完成，17 个 text_delta，`stopReason: "stop"`，exit 0 |
 | 自定义工具闭环 + 取消传递（M1） | ✅ 工具收到 `AbortSignal` 并在 abort 后 1231ms 退出；`abort()` 耗时 2ms；`steer()` 返回 `"queued"` |
-| 多轮工具循环的取消确认时点 / 超时清理 / 会话持久化 | ⛔ **未验证** —— M1 剩余项 |
+| 真实双 Worker 并行与上下文隔离（M2） | ✅ 两个真实 Session 时间上重叠 1818ms；结果互不串味；取消其一不影响另一个（`npm run example:workers`） |
+| 会话生命周期（重复请求 / 退订 / dispose / 内存 vs 持久化） | ✅ 5 项检查全部通过（`npm run example:lifecycle`） |
+| 多轮工具循环中的取消确认时点 | ⚠️ **部分验证**：单轮工具执行期间取消已证实；多轮循环场景未单独验证 |
 
 ---
 

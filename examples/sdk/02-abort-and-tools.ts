@@ -19,11 +19,11 @@
 import {
   createAgentSession,
   defineTool,
-  ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+import { selectModel } from "../../src/adapters/pi/model-selection.ts";
 import {
   classifySessionOutcome,
   readAssistantFinalMessage,
@@ -130,15 +130,8 @@ async function run(): Promise<number> {
   const log = createLogger({ level: config.logLevel, context: { component: "examples.sdk.abort" } });
   assertModelCredentials(config);
 
-  const modelRuntime = await ModelRuntime.create(
-    config.modelsPath === undefined ? {} : { modelsPath: config.modelsPath },
-  );
-  const available = await modelRuntime.getAvailable();
-  const model =
-    config.modelProvider !== undefined && config.modelId !== undefined
-      ? modelRuntime.getModel(config.modelProvider, config.modelId)
-      : available[0];
-  if (model === undefined) throw new ConfigError("没有可用的模型，请检查 .env 与 config/models.json");
+  const selected = await selectModel(config);
+  const model = selected.model;
 
   const observation: ToolObservation = {
     called: 0,
@@ -151,8 +144,8 @@ async function run(): Promise<number> {
 
   const { session } = await createAgentSession({
     cwd: config.workspace,
-    modelRuntime,
-    model,
+    modelRuntime: selected.modelRuntime,
+    model: selected.model,
     // 去掉内建工具，避免模型用 bash 绕过实验；保留自定义工具。
     noTools: "builtin",
     customTools: [createSlowProbeTool(observation)],

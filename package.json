@@ -12,6 +12,8 @@
     "start": "node --env-file-if-exists=.env src/app.ts",
     "example:sdk": "node --env-file-if-exists=.env examples/sdk/01-minimal.ts",
     "example:abort": "node --env-file-if-exists=.env examples/sdk/02-abort-and-tools.ts",
+    "example:workers": "node --env-file-if-exists=.env examples/sdk/03-two-workers.ts",
+    "example:lifecycle": "node --env-file-if-exists=.env examples/sdk/04-session-lifecycle.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
