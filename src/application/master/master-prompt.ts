@@ -1,14 +1,22 @@
 /**
- * Master 提示词构造（M4）。
+ * Master 提示词（两种模式）。
  *
- * 决策清单已确认：**用提示词要求 JSON + 严格解析与降级**，不依赖 provider 的
- * `response_format` 等特性。这样才能在任意 OpenAI 兼容端点上可复现、可单测。
+ * ## 模式 1：意图决策（用户输入触发的唤醒）
+ * 输入是「世界快照 + 对话历史」，输出是调度建议（start_task / cancel_task / set_focus）。
  *
- * 要点：
- * - 要求模型**原样回填** 快照里的 revision，据此判断决策是否过期；
- * - 取消动作必须回填 `expectedGeneration`，这是防止「过期决策误取消已换代任务」的前置条件；
- * - 明确「一个目标内多步骤不要拆分」，对应 SRS §3.2 的任务拆分单位。
+ * ## 模式 2：交付决策（结果产出后的唤醒）
+ * 输入是「世界快照 + 对话历史 + 待交付结果批次」，输出是交付建议（deliver_results）。
+ * 这一模式存在的意义：**交付该不该现在做、要不要把几条结果合并成一次回答**，
+ * 是纯语义判断，确定性规则写不出来。
+ *
+ * ## 两种模式共同遵守的约束
+ * - 提示词只影响「建议」，落地一律经逐动作校验与确定性仲裁器；
+ * - 要求模型**原样回填** revision，用于判断决策是否过期；
+ * - 取消/交付都必须回填前置条件（`expectedGeneration` / 任务必须已成功），
+ *   过期决策不得误取消已完成任务、不得交付未就绪结果。
  */
+import type { DialogueEntry } from "../interaction/dialogue-history.ts";
+import type { PendingResult } from "../delivery/delivery-batcher.ts";
 import type { MasterContextView } from "./context-view.ts";
 
 export const MASTER_OUTPUT_SCHEMA_HINT = `{
@@ -18,18 +26,95 @@ export const MASTER_OUTPUT_SCHEMA_HINT = `{
   "actions": [
     { "type": "start_task", "goal": "独立目标", "priority": "low|normal|high|urgent", "reason": "可选" },
     { "type": "cancel_task", "taskId": "task-N", "expectedGeneration": 快照中该任务的 runGeneration, "reason": "可选" },
-    { "type": "set_focus", "taskId": "task-N" }
+    { "type": "set_focus", "taskId": "task-N" },
+    { "type": "deliver_results", "taskIds": ["task-1", "task-2"], "text": "合并后的口语播报稿", "priority": "low|normal|high|urgent", "timing": "now|after_current" }
   ]
 }`;
 
-export function buildMasterPrompt(view: MasterContextView): string {
+const SHARED_RULES = [
+  "1. `basedOn` 必须**原样回填**世界快照中的 `revision.eventSeq` 与 `revision.controlRevision`。",
+  "2. **一个目标内的多步骤不要拆成多个 Task**；只有真正相互独立的目标才分别 `start_task`。",
+  "3. `cancel_task` 必须回填快照中该任务的 `runGeneration` 作为 `expectedGeneration`；",
+  "   任务已完成、已取消或已换代的取消动作会被拒绝。",
+  "4. 只取消确实应当停止的任务；无法判断时宁可不输出该动作。",
+  "5. 不需要做任何事时，`actions` 输出空数组 `[]`。",
+  "6. 不要输出 JSON 之外的任何内容。",
+];
+
+export interface MasterPromptRequest {
+  readonly mode: "intent" | "delivery";
+  readonly view: MasterContextView;
+  readonly dialogue: readonly DialogueEntry[];
+  readonly pendingResults: readonly PendingResult[];
+}
+
+function renderDialogue(dialogue: readonly DialogueEntry[]): string {
+  if (dialogue.length === 0) return "（还没有对话历史）";
+  return dialogue
+    .map((entry) => `${entry.role === "user" ? "用户" : "系统"}：${entry.text}`)
+    .join("\n");
+}
+
+export function buildMasterPrompt(request: MasterPromptRequest): string {
+  const pending = request.pendingResults
+    .map(
+      (item) =>
+        `- ${item.taskId}（priority=${item.priority}）\n  完整结果：${item.fullSummary}\n  口语稿：${item.spokenSummary}`,
+    )
+    .join("\n");
+
+  if (request.mode === "delivery") {
+    return [
+      "你是**交付决策器**。刚刚有任务完成，你需要决定「怎么把结果告诉用户」。",
+      "你的输出会被程序严格解析，因此**只输出一个 JSON 对象**。",
+      "",
+      "## 世界快照",
+      "```json",
+      JSON.stringify(request.view, null, 2),
+      "```",
+      "",
+      "## 最近的对话历史",
+      renderDialogue(request.dialogue),
+      "",
+      "## 本批待交付的结果",
+      pending.length > 0 ? pending : "（空）",
+      "",
+      "## 你的任务",
+      "对这批待交付结果给出**一个** `deliver_results` 动作：",
+      "- `taskIds`：本批要交付的任务，**通常就是全部**；确实不该播的可以不列入；",
+      "- `text`：**合并后的口语播报稿** —— 把几条结果综合成一次自然的回答，",
+      "  1～3 句，直接说结论，不要 Markdown、代码、列表、链接、文件路径；",
+      "- `priority`：这批结果对**当前用户**的实际紧急度（不是任务创建时的先验）；",
+      "  只有确实需要立刻打断用户时才用 `urgent`；",
+      "- `timing`：`now` 表示可以抢占当前播报（仍受确定性规则约束），",
+      "  `after_current` 表示等当前语句播完再说。**无法判断时用 `after_current`**。",
+      "",
+      "## 判断依据（请真的用它）",
+      "- 用户最近在问什么？这批结果是不是他在等的？",
+      "- 几条结果是否相关？相关就合并叙述，不要机械地逐条罗列；",
+      "- 结果里有没有**需要用户决策**、**阻塞或失败**、**坏消息**？",
+      "  有的话应当更早说、说得更明确；",
+      "- 用户是否明确表示过不要某个任务的结果？",
+      "",
+      "## 输出格式",
+      "```json",
+      MASTER_OUTPUT_SCHEMA_HINT,
+      "```",
+      "",
+      "只输出 JSON 对象，不要任何解释。",
+    ].join("\n");
+  }
+
   return [
-    "你是调度决策器。你的输出会被程序严格解析，因此**只输出一个 JSON 对象**，不要输出解释、前后缀或 Markdown 代码块以外的任何文字。",
+    "你是调度决策器。你的输出会被程序严格解析，因此**只输出一个 JSON 对象**，不要输出解释、前后缀或其他文字。",
     "",
     "## 当前世界快照",
     "```json",
-    JSON.stringify(view, null, 2),
+    JSON.stringify(request.view, null, 2),
     "```",
+    "",
+    "## 最近的对话历史",
+    renderDialogue(request.dialogue),
     "",
     "## 输出格式",
     "```json",
@@ -37,12 +122,7 @@ export function buildMasterPrompt(view: MasterContextView): string {
     "```",
     "",
     "## 规则",
-    "1. `basedOn` 必须**原样回填**快照中的 `revision.eventSeq` 与 `revision.controlRevision`。",
-    "2. **一个目标内的多步骤不要拆成多个 Task**；只有真正相互独立的目标才分别 `start_task`。",
-    "3. `cancel_task` 必须回填快照中该任务的 `runGeneration` 作为 `expectedGeneration`；",
-    "   任务已完成、已取消或已换代的取消动作会被拒绝。",
-    "4. 只取消确实应当停止的任务；无法判断时宁可不输出该动作。",
-    "5. 不需要做任何事时，`actions` 输出空数组 `[]`。",
-    "6. 不要输出 JSON 之外的任何内容。",
+    ...SHARED_RULES,
+    "7. 本模式只需给出调度建议；结果交付由交付决策器负责，不要输出 `deliver_results`。",
   ].join("\n");
 }

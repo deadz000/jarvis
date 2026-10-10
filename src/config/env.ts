@@ -47,6 +47,30 @@ export const DEFAULT_MODELS_RELATIVE_PATH = join("config", "models.json");
 export const DEFAULT_MAX_CONCURRENT_TASKS = 4;
 
 /**
+ * 阿里云语音服务配置。
+ *
+ * **命名约定**：标准名为带 `DASHSCOPE_` 前缀的大写形式；
+ * 同时兼容早期写入的 `ASR_model` / `TTS_model`（大小写混用的名字容易出错），
+ * 但以标准名为准，见 `docs/ASR-TTS接入准备清单_v0.1.md`。
+ *
+ * **默认关闭**：`JARVIS_VOICE_ENABLED` 默认 false —— 没验证通过前不误触真实计费。
+ */
+export const DASHSCOPE_KEY_ENV_VAR = "DASHSCOPE_API_KEY";
+
+export interface VoiceServiceConfig {
+  /** 是否检测到 DashScope 凭据（**不含密钥值**）。字段名刻意不含 credential，否则会被日志脱敏规则误伤。 */
+  readonly keyDetected: boolean;
+  readonly workspaceId: string | undefined;
+  readonly asrModel: string | undefined;
+  readonly ttsModel: string | undefined;
+  readonly ttsVoice: string | undefined;
+  /** 是否显式启用语音链路。 */
+  readonly enabled: boolean;
+  /** 缺少的必填项（用于给出可操作提示）。 */
+  readonly missing: readonly string[];
+}
+
+/**
  * Master 决策超时。超时按降级策略处理：**不执行任何动作**，不猜测意图。
  * 30s 是暂定值，必须按实测模型延迟重新标定（实施计划 M4：具体超时值基于模型实测配置）。
  */
@@ -74,6 +98,8 @@ export interface AppConfig {
   readonly maxConcurrentTasks: number;
   /** Master 决策超时（毫秒）；超时 → 空计划，不改动任何状态。 */
   readonly masterTimeoutMs: number;
+  /** 阿里云语音服务配置（ASR/TTS）。 */
+  readonly voice: VoiceServiceConfig;
   readonly credentials: CredentialStatus;
 }
 
@@ -140,6 +166,26 @@ function parseMasterTimeoutMs(env: NodeJS.ProcessEnv): number {
   return parsed;
 }
 
+function parseVoiceConfig(env: NodeJS.ProcessEnv): VoiceServiceConfig {
+  const keyDetected = readOptional(env, DASHSCOPE_KEY_ENV_VAR) !== undefined;
+  const workspaceId = readOptional(env, "DASHSCOPE_WORKSPACE_ID");
+  // 标准名优先，兼容早期的大小写混用名
+  const asrModel = readOptional(env, "DASHSCOPE_ASR_MODEL") ?? readOptional(env, "ASR_model");
+  const ttsModel = readOptional(env, "DASHSCOPE_TTS_MODEL") ?? readOptional(env, "TTS_model");
+  const ttsVoice = readOptional(env, "DASHSCOPE_TTS_VOICE");
+  const enabledRaw = readOptional(env, "JARVIS_VOICE_ENABLED");
+  const enabled = enabledRaw === "1" || enabledRaw === "true";
+
+  const missing: string[] = [];
+  if (!keyDetected) missing.push(DASHSCOPE_KEY_ENV_VAR);
+  if (workspaceId === undefined) missing.push("DASHSCOPE_WORKSPACE_ID");
+  if (asrModel === undefined) missing.push("DASHSCOPE_ASR_MODEL");
+  if (ttsModel === undefined) missing.push("DASHSCOPE_TTS_MODEL");
+  if (ttsVoice === undefined) missing.push("DASHSCOPE_TTS_VOICE");
+
+  return { keyDetected, workspaceId, asrModel, ttsModel, ttsVoice, enabled, missing };
+}
+
 function detectCredentials(env: NodeJS.ProcessEnv, modelProvider: string | undefined): CredentialStatus {
   const detectedProviders: string[] = [];
   const detectedEnvVars: string[] = [];
@@ -176,6 +222,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     modelsPath: parseModelsPath(env, workspace),
     maxConcurrentTasks: parseMaxConcurrentTasks(env),
     masterTimeoutMs: parseMasterTimeoutMs(env),
+    voice: parseVoiceConfig(env),
     credentials: detectCredentials(env, modelProvider),
   };
 }
@@ -196,6 +243,13 @@ export function describeConfig(config: AppConfig): Record<string, unknown> {
     modelsPath: config.modelsPath ?? null,
     maxConcurrentTasks: config.maxConcurrentTasks,
     masterTimeoutMs: config.masterTimeoutMs,
+    voiceEnabled: config.voice.enabled,
+    voiceKeyDetected: config.voice.keyDetected,
+    voiceWorkspaceId: config.voice.workspaceId ?? null,
+    voiceAsrModel: config.voice.asrModel ?? null,
+    voiceTtsModel: config.voice.ttsModel ?? null,
+    voiceTtsVoice: config.voice.ttsVoice ?? null,
+    voiceMissing: config.voice.missing,
     detectedProviders: config.credentials.detectedProviders,
     detectedEnvVars: config.credentials.detectedEnvVars,
   };

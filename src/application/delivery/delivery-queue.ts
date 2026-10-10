@@ -20,9 +20,15 @@ const PRIORITY_RANK: Readonly<Record<Priority, number>> = Object.fromEntries(
 
 export interface DeliveryItem {
   readonly id: string;
+  /** 批次内的**主任务**（展示与播放授权归属用）。 */
   readonly taskId: string;
+  /** 批次内的全部任务。合并交付时长度 > 1。 */
+  readonly taskIds: readonly string[];
+  /** 实际播报文本（合并交付时是综合稿）。 */
   readonly summary: string;
   readonly priority: Priority;
+  /** 是否允许本项触发抢占（交付决策给 `after_current` 时为 false）。 */
+  readonly allowPreemption: boolean;
   readonly enqueuedAt: number;
   readonly status: "queued" | "playing" | "delivered";
   readonly deliveredAt?: number;
@@ -80,16 +86,44 @@ export class DeliveryQueue {
   /**
    * 结果就绪。**永不抢占**：正在播放时一律排队等待。
    */
-  public enqueue(input: { taskId: string; summary: string; priority?: Priority }): DeliveryItem {
+  public enqueue(input: {
+    taskId: string;
+    summary: string;
+    priority?: Priority;
+    allowPreemption?: boolean;
+  }): DeliveryItem {
+    return this.enqueueBatch({
+      taskIds: [input.taskId],
+      text: input.summary,
+      ...(input.priority === undefined ? {} : { priority: input.priority }),
+      ...(input.allowPreemption === undefined ? {} : { allowPreemption: input.allowPreemption }),
+    });
+  }
+
+  /**
+   * 批量入队（合并交付）。一条交付项可承载多个任务的结果，
+   * 播报文本是交付决策给出的**综合稿** —— 这是「两个任务同时完成合成一次回答」的落点。
+   */
+  public enqueueBatch(input: {
+    taskIds: readonly string[];
+    text: string;
+    priority?: Priority;
+    allowPreemption?: boolean;
+  }): DeliveryItem {
+    const primary = input.taskIds[0];
+    if (primary === undefined) throw new Error("enqueueBatch 需要至少一个 taskId");
+
     const at = this.now();
     const id = `delivery-${this.nextOrdinal}`;
     this.nextOrdinal += 1;
 
     const item: DeliveryItem = {
       id,
-      taskId: input.taskId,
-      summary: input.summary.slice(0, this.maxSummaryLength),
+      taskId: primary,
+      taskIds: [...input.taskIds],
+      summary: input.text.slice(0, this.maxSummaryLength),
       priority: input.priority ?? DEFAULT_PRIORITY,
+      allowPreemption: input.allowPreemption ?? true,
       enqueuedAt: at,
       status: "queued",
     };
@@ -141,7 +175,9 @@ export class DeliveryQueue {
     // 已经在播紧急内容，无需抢占
     if (playing.priority === "urgent") return;
 
-    const urgentWaiting = this.items().find((item) => item.status === "queued" && item.priority === "urgent");
+    const urgentWaiting = this.items().find(
+      (item) => item.status === "queued" && item.priority === "urgent" && item.allowPreemption,
+    );
     if (urgentWaiting === undefined) return;
 
     const reason = `urgent 结果 ${urgentWaiting.taskId} 优先：在当前语句的分片边界停止 ${playing.taskId}`;
@@ -171,7 +207,9 @@ export class DeliveryQueue {
   }
 
   private markDelivered(taskId: string): void {
-    const playing = this.items().find((item) => item.status === "playing" && item.taskId === taskId);
+    const playing = this.items().find(
+      (item) => item.status === "playing" && item.taskIds.includes(taskId),
+    );
     if (playing === undefined) return;
     const delivered: DeliveryItem = { ...playing, status: "delivered", deliveredAt: this.now() };
     this.itemsById.set(playing.id, delivered);

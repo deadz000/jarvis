@@ -22,10 +22,12 @@ import type { SelectedModel } from "../adapters/pi/model-selection.ts";
 import { PiMasterAdapter } from "../adapters/pi/pi-master.ts";
 import { PiWorkerRuntime } from "../adapters/pi/pi-worker-runtime.ts";
 import { InteractionFocusStore } from "./interaction/focus.ts";
+import { DialogueHistory, type DialogueEntry } from "./interaction/dialogue-history.ts";
 import { WorldModel } from "./master/context-view.ts";
 import { MasterDecisionPlane } from "./master/decision-plane.ts";
 import { TaskScheduler } from "./scheduler/scheduler.ts";
 import { DeliveryQueue } from "./delivery/delivery-queue.ts";
+import { DeliveryBatcher, type PendingResult } from "./delivery/delivery-batcher.ts";
 import { SimulatedAudioManager } from "./delivery/audio-manager.ts";
 
 export interface TaskView {
@@ -78,6 +80,8 @@ export interface RuntimeSnapshot {
   readonly audio: AudioView;
   readonly lastDecision: DecisionView | null;
   readonly timeline: readonly TimelineEntry[];
+  /** 有界对话记忆（最近若干条），让面板能看出"系统记得什么"。 */
+  readonly dialogue: readonly DialogueEntry[];
 }
 
 export interface JarvisRuntimeOptions {
@@ -98,9 +102,11 @@ export class JarvisRuntime {
   private readonly scheduler: TaskScheduler;
   private readonly world: WorldModel;
   private readonly focus = new InteractionFocusStore();
+  private readonly dialogue = new DialogueHistory();
   private readonly plane: MasterDecisionPlane;
   private readonly audio: SimulatedAudioManager;
   private readonly delivery: DeliveryQueue;
+  private readonly batcher: DeliveryBatcher;
 
   private readonly listeners = new Set<(snapshot: RuntimeSnapshot) => void>();
   private readonly unsubscribers: Array<() => void> = [];
@@ -143,8 +149,17 @@ export class JarvisRuntime {
       scheduler: this.scheduler,
       world: this.world,
       focus: this.focus,
+      dialogue: this.dialogue,
+      delivery: this.delivery,
       timeoutMs: options.config.masterTimeoutMs,
       ...(options.logger === undefined ? {} : { logger: options.logger }),
+    });
+
+    // 结果产出后不立刻播：先进合并窗口，由 Master 决定怎么交付（含多结果合并）。
+    this.batcher = new DeliveryBatcher({
+      onFlush: (batch) => {
+        void this.runDeliveryDecision(batch);
+      },
     });
 
     this.wireObservability();
@@ -154,11 +169,14 @@ export class JarvisRuntime {
 
   /** 聊天输入：走完整 Master 决策链路。 */
   public async handleUserInput(text: string): Promise<DecisionView> {
+    // 一个用户 turn 只记一次（避免一次输入被重复记账）
+    this.dialogue.appendUserTurn(text);
     this.pushTimeline("user_input", text);
     this.emitUpdate();
 
     const result = await this.plane.decide({ userInput: text });
     this.lastDecision = toDecisionView(result);
+    this.dialogue.appendSystem(`调度决策：${describeDecision(this.lastDecision)}`);
     this.pushTimeline("decision", describeDecision(this.lastDecision));
     this.emitUpdate();
     return this.lastDecision;
@@ -209,6 +227,7 @@ export class JarvisRuntime {
       },
       lastDecision: this.lastDecision,
       timeline: [...this.timeline],
+      dialogue: this.dialogue.recent(10),
     };
   }
 
@@ -223,6 +242,7 @@ export class JarvisRuntime {
     if (this.disposed) return;
     this.disposed = true;
     for (const unsubscribe of this.unsubscribers) unsubscribe();
+    this.batcher.dispose();
     this.delivery.dispose();
     this.audio.stop("演示结束");
     this.world.dispose();
@@ -239,11 +259,14 @@ export class JarvisRuntime {
         if (event.type === "task_succeeded") {
           const task = this.scheduler.getTask(event.taskId);
           if (task?.resultSummary !== undefined) {
-            // 结果就绪 → 面板立刻可见（用完整结果），交付另行排队（用口语稿）。
-            this.delivery.enqueue({
+            // 结果就绪 → 面板立刻可见（完整结果）；
+            // 播报不立刻发生，先进入合并窗口，由 Master 交付决策决定怎么讲。
+            this.batcher.add({
               taskId: task.taskId,
-              summary: task.spokenSummary ?? task.resultSummary,
+              fullSummary: task.resultSummary,
+              spokenSummary: task.spokenSummary ?? task.resultSummary,
               priority: task.priority,
+              at: Date.now(),
             });
           }
         }
@@ -266,8 +289,30 @@ export class JarvisRuntime {
     );
   }
 
-  private pushTimeline(kind: string, text: string): void {
-    this.timeline.push({ at: Date.now(), kind, text });
+  /**
+   * 结果批次出窗口后的一次交付决策。
+   * 失败/超时不会丢结果 —— 决策平面内部有确定性兜底交付。
+   */
+  private async runDeliveryDecision(batch: readonly PendingResult[]): Promise<void> {
+    this.pushTimeline(
+      "delivery_batch",
+      `${batch.length} 条结果出合并窗口：${batch.map((item) => item.taskId).join("、")}`,
+    );
+    try {
+      const result = await this.plane.decideDelivery(batch);
+      this.lastDecision = toDecisionView(result);
+      this.dialogue.appendSystem(`交付决策：${describeDecision(this.lastDecision)}`);
+      this.pushTimeline("delivery_decision", describeDecision(this.lastDecision));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger?.warn("runtime.delivery_decision_failed", { error: message });
+      this.pushTimeline("delivery_decision_failed", `交付决策异常：${message}`);
+    } finally {
+      this.emitUpdate();
+    }
+  }
+
+  private pushTimeline(kind: string, text: string): void {    this.timeline.push({ at: Date.now(), kind, text });
     while (this.timeline.length > this.maxTimelineEntries) this.timeline.shift();
   }
 

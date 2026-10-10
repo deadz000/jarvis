@@ -32,13 +32,24 @@ export interface SetFocusCommand {
   readonly decisionId: string;
 }
 
-export type CompiledCommand = StartTaskCommand | CancelTaskCommand | SetFocusCommand;
+export interface DeliverResultsCommand {
+  readonly type: "deliver_results";
+  readonly taskIds: readonly string[];
+  readonly text: string;
+  readonly priority: Priority;
+  readonly timing: "now" | "after_current";
+  readonly decisionId: string;
+}
+
+export type CompiledCommand = StartTaskCommand | CancelTaskCommand | SetFocusCommand | DeliverResultsCommand;
 
 export type ActionRejectionReason =
   | "task_not_found"
   | "already_terminal"
   | "already_cancel_requested"
-  | "generation_mismatch";
+  | "generation_mismatch"
+  /** 结果尚未就绪（任务不存在或还没成功），不能交付。 */
+  | "result_not_ready";
 
 export interface RejectedAction {
   readonly action: DecisionAction;
@@ -142,6 +153,35 @@ export function validateDecision(decision: MasterDecision, context: ValidationCo
           return;
         }
         accepted.push({ type: "set_focus", taskId: action.taskId, decisionId: decision.decisionId });
+        return;
+      }
+
+      case "deliver_results": {
+        // 交付的前置条件：任务必须存在**且已经成功**。
+        // 未就绪的结果不允许交付（否则会把失败/进行中的东西当结果播报出去）。
+        const missing: string[] = [];
+        const notSucceeded: string[] = [];
+        for (const taskId of action.taskIds) {
+          const task = context.getTask(taskId);
+          if (task === undefined) missing.push(taskId);
+          else if (task.state !== "succeeded") notSucceeded.push(`${taskId}(${task.state})`);
+        }
+        if (missing.length > 0 || notSucceeded.length > 0) {
+          rejected.push({
+            action,
+            reason: "result_not_ready",
+            detail: { missing, notSucceeded },
+          });
+          return;
+        }
+        accepted.push({
+          type: "deliver_results",
+          taskIds: [...action.taskIds],
+          text: action.text,
+          priority: action.priority,
+          timing: action.timing,
+          decisionId: decision.decisionId,
+        });
         return;
       }
     }

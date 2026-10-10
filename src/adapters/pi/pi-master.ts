@@ -43,11 +43,11 @@ export class PiMasterAdapter implements MasterPort {
   }
 
   public async proposeDecision(request: MasterRequest): Promise<MasterProposal> {
-    const { view, signal } = request;
-    return this.runOnce(view, signal);
+    return this.runOnce(request);
   }
 
-  private async runOnce(view: MasterContextView, signal: AbortSignal | undefined): Promise<MasterProposal> {
+  private async runOnce(request: MasterRequest): Promise<MasterProposal> {
+    const { signal } = request;
     const logger = this.options.logger;
 
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
@@ -80,7 +80,7 @@ export class PiMasterAdapter implements MasterPort {
     signal?.addEventListener("abort", onAbort, { once: true });
 
     try {
-      await session.prompt(buildMasterPrompt(view));
+      await session.prompt(buildMasterPrompt(request));
 
       const outcome = classifySessionOutcome(finalAssistant, session.getLastAssistantText(), {
         cancelRequested: signal?.aborted === true,

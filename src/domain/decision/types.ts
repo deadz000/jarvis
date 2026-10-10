@@ -47,7 +47,22 @@ export type SetFocusAction = {
   readonly reason?: string;
 };
 
-export type DecisionAction = StartTaskAction | CancelTaskAction | SetFocusAction;
+/**
+ * 交付结果（交付决策模式的产出）。
+ * 一条动作可覆盖**多个任务** —— 这就是「两个任务同时完成、合并成一次回答」的表达方式。
+ */
+export type DeliverResultsAction = {
+  readonly type: "deliver_results";
+  readonly taskIds: readonly string[];
+  /** 实际播报文本（口语化；多条结果时是综合稿）。 */
+  readonly text: string;
+  readonly priority: Priority;
+  /** `now` = 允许抢占（仍受确定性规则约束）；`after_current` = 等当前语句播完。 */
+  readonly timing: "now" | "after_current";
+  readonly reason?: string;
+};
+
+export type DecisionAction = StartTaskAction | CancelTaskAction | SetFocusAction | DeliverResultsAction;
 
 export interface MasterDecision {
   readonly decisionId: string;

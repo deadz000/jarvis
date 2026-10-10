@@ -12,6 +12,9 @@
  */
 import type { WorldRevision } from "../../domain/decision/types.ts";
 import type { Logger } from "../../observability/logger.ts";
+import type { DialogueEntry, DialogueHistory } from "../interaction/dialogue-history.ts";
+import type { PendingResult } from "../delivery/delivery-batcher.ts";
+import type { DeliveryQueue } from "../delivery/delivery-queue.ts";
 import type { InteractionFocusStore } from "../interaction/focus.ts";
 import type { TaskScheduler } from "../scheduler/scheduler.ts";
 import type { MasterContextView, WorldModel } from "./context-view.ts";
@@ -24,7 +27,17 @@ export interface MasterPort {
 }
 
 export interface MasterRequest {
+  /**
+   * `intent` = 用户输入触发（调度建议）；
+   * `delivery` = 结果产出触发（交付建议）。
+   */
+  readonly mode: "intent" | "delivery";
+  /** 有界世界快照。 */
   readonly view: MasterContextView;
+  /** 最近对话历史（有界）。没有它，Master 不记得自己上一轮做了什么。 */
+  readonly dialogue: readonly DialogueEntry[];
+  /** 本批待交付结果（仅 delivery 模式非空）。 */
+  readonly pendingResults: readonly PendingResult[];
   /** 超时或取消时用于中止模型调用，避免遗留运行中的 Session。 */
   readonly signal?: AbortSignal;
 }
@@ -68,6 +81,10 @@ export interface DecisionPlaneOptions {
   readonly world: WorldModel;
   readonly focus: InteractionFocusStore;
   readonly timeoutMs: number;
+  /** 对话历史（有界）。省略时 Master 看不到任何历史。 */
+  readonly dialogue?: DialogueHistory;
+  /** 交付队列。交付决策的落地目标；省略时交付类动作无法执行。 */
+  readonly delivery?: DeliveryQueue;
   readonly now?: () => number;
   readonly logger?: Logger;
 }
@@ -98,6 +115,8 @@ export class MasterDecisionPlane {
   private readonly world: WorldModel;
   private readonly focus: InteractionFocusStore;
   private readonly timeoutMs: number;
+  private readonly dialogue: DialogueHistory | undefined;
+  private readonly delivery: DeliveryQueue | undefined;
   private readonly now: () => number;
   private readonly logger: Logger | undefined;
 
@@ -107,6 +126,8 @@ export class MasterDecisionPlane {
     this.world = options.world;
     this.focus = options.focus;
     this.timeoutMs = options.timeoutMs;
+    this.dialogue = options.dialogue;
+    this.delivery = options.delivery;
     this.now = options.now ?? (() => Date.now());
     this.logger = options.logger;
   }
@@ -118,6 +139,30 @@ export class MasterDecisionPlane {
   public async decide(
     input: { readonly userInput?: string; readonly source?: string } = {},
   ): Promise<DecisionCycleResult> {
+    return this.runCycle({ mode: "intent", pendingResults: [], input });
+  }
+
+  /**
+   * 交付决策（结果产出后的第二种唤醒时机）。
+   *
+   * 关键不变量：**降级也不丢结果** —— 若交付决策超时/失败/解析失败，
+   * 由确定性规则逐条兜底交付（踩坑指南铁律 7）。
+   */
+  public async decideDelivery(batch: readonly PendingResult[]): Promise<DecisionCycleResult> {
+    if (batch.length === 0) {
+      return this.noOp("empty_plan", this.world.revision(), 0, "交付批次为空，无需决策");
+    }
+    const result = await this.runCycle({ mode: "delivery", pendingResults: batch, input: {} });
+    if (result.applied.some((action) => action.type === "deliver_results")) return result;
+    return this.fallbackDeliver(batch, result);
+  }
+
+  private async runCycle(run: {
+    readonly mode: "intent" | "delivery";
+    readonly pendingResults: readonly PendingResult[];
+    readonly input: { readonly userInput?: string; readonly source?: string };
+  }): Promise<DecisionCycleResult> {
+    const input = run.input;
     if (input.userInput !== undefined) {
       this.world.ingestInput({ source: input.source ?? "user", text: input.userInput });
     }
@@ -130,9 +175,13 @@ export class MasterDecisionPlane {
     let proposal: MasterProposal;
     try {
       proposal = await withTimeout(
-        this.master.proposeDecision(
-          controller.signal === undefined ? { view } : { view, signal: controller.signal },
-        ),
+        this.master.proposeDecision({
+          mode: run.mode,
+          view,
+          dialogue: this.dialogueEntries(),
+          pendingResults: run.pendingResults,
+          signal: controller.signal,
+        }),
         this.timeoutMs,
         () => {
           controller.abort("master_timeout");
@@ -227,6 +276,10 @@ export class MasterDecisionPlane {
     return result;
   }
 
+  private dialogueEntries(): readonly DialogueEntry[] {
+    return this.dialogue?.recent() ?? [];
+  }
+
   private noOp(
     status: DecisionCycleStatus,
     revisionAtDecision: WorldRevision,
@@ -277,6 +330,43 @@ export class MasterDecisionPlane {
         });
         return { type: "set_focus", detail: record.taskId ?? "(清空焦点)" };
       }
+      case "deliver_results": {
+        if (this.delivery === undefined) {
+          throw new Error("未配置交付队列，无法执行 deliver_results");
+        }
+        const entry = this.delivery.enqueueBatch({
+          taskIds: command.taskIds,
+          text: command.text,
+          priority: command.priority,
+          // after_current：明确不允许抢占（即使被判为 urgent）
+          allowPreemption: command.timing === "now",
+        });
+        return {
+          type: "deliver_results",
+          detail: `${command.taskIds.join("+")} → ${entry.id}（priority=${command.priority}, timing=${command.timing}）`,
+        };
+      }
     }
+  }
+
+  /** Master 不可用时的确定性兜底：结果必须被交付，不能因为模型失败而丢失。 */
+  private fallbackDeliver(
+    batch: readonly PendingResult[],
+    result: DecisionCycleResult,
+  ): DecisionCycleResult {
+    if (this.delivery === undefined) return result;
+
+    const applied: AppliedAction[] = batch.map((item) => {
+      const entry = this.delivery?.enqueue({
+        taskId: item.taskId,
+        summary: item.spokenSummary,
+        priority: item.priority,
+      });
+      return { type: "deliver_fallback", detail: `${item.taskId} → ${entry?.id ?? "?"}` };
+    });
+
+    const note = `${result.note ?? result.status}；已按确定性规则兜底交付 ${batch.length} 条结果（结果不会因 Master 失败而丢失）`;
+    this.logger?.warn("master.delivery_fallback", { count: batch.length, reason: result.status });
+    return { ...result, status: "applied", applied: [...result.applied, ...applied], note };
   }
 }

@@ -119,6 +119,47 @@ function normalizeAction(raw: unknown, index: number): ActionNormalization {
     };
   }
 
+  if (type === "deliver_results") {
+    const rawIds = record["taskIds"];
+    if (!Array.isArray(rawIds) || rawIds.length === 0) {
+      return { ok: false, reason: `actions[${index}] deliver_results 需要非空 taskIds 数组` };
+    }
+    const taskIds: string[] = [];
+    for (const candidate of rawIds) {
+      const parsedId = readNonEmptyString(candidate);
+      if (parsedId === undefined) {
+        return { ok: false, reason: `actions[${index}] deliver_results 的 taskIds 含非字符串项` };
+      }
+      taskIds.push(parsedId);
+    }
+
+    const text = readNonEmptyString(record["text"]);
+    if (text === undefined) return { ok: false, reason: `actions[${index}] deliver_results 缺少非空 text` };
+
+    const rawPriority = record["priority"];
+    if (rawPriority !== undefined && !isPriority(rawPriority)) {
+      return { ok: false, reason: `actions[${index}] deliver_results 的 priority 非法：${String(rawPriority)}` };
+    }
+
+    const rawTiming = record["timing"];
+    if (rawTiming !== undefined && rawTiming !== "now" && rawTiming !== "after_current") {
+      return { ok: false, reason: `actions[${index}] deliver_results 的 timing 非法：${String(rawTiming)}` };
+    }
+
+    return {
+      ok: true,
+      action: {
+        type,
+        taskIds,
+        text,
+        priority: isPriority(rawPriority) ? rawPriority : DEFAULT_PRIORITY,
+        // 无法确认时保守选 after_current：不抢占总是安全的
+        timing: rawTiming === "now" ? "now" : "after_current",
+        ...(reason === undefined ? {} : { reason }),
+      },
+    };
+  }
+
   return { ok: false, reason: `actions[${index}] 未知动作类型：${type}` };
 }
 
