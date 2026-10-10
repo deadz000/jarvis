@@ -10,6 +10,9 @@ dist/
 auth.json
 .pi/
 
+# Pi SDK 运行时产物：models.json 旁的模型注册表缓存（FileModelsStore 自动写入）
+config/models-store.json
+
 # Pi 会话与运行时产物
 sessions/
 *.session.jsonl

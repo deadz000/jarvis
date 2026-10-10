@@ -134,6 +134,14 @@ agent_start → turn_start → message_start/message_end ×3 → turn_end → ag
 - 或来自配置目录 `~/.pi/agent/auth.json`；`PI_CODING_AGENT_DIR` 可覆盖该目录；
 - SDK 嵌入时**不会**自动设置 `AI_AGENT`/`PI_CODING_AGENT` 进程标记。
 
+### 3.4 SDK 会写入的运行时文件（实测）
+
+`ModelRuntime.create({ modelsPath })` 会在 `models.json` **同目录**自动创建 `models-store.json`
+（`FileModelsStore`，模型注册表缓存）。它属于运行时产物而非配置：
+- 已被 `.gitignore` 排除，不入库；
+- 可用 `modelsStorePath` 改写位置，或传 `modelsStore` 完全替换；
+- 传 `modelsPath: null` 时 SDK 改用内存实现（不落盘）。
+
 ---
 
 ## 4. 决定
