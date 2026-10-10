@@ -101,3 +101,17 @@ export interface WorkerRuntime {
   /** 启动一次执行代次。实现方必须自行按契约携带 taskId/runGeneration 汇报事件。 */
   start(request: WorkerStartRequest): WorkerHandle;
 }
+
+/**
+ * 逐 token 的文本增量（**高频通道**）。
+ *
+ * 刻意**不**放进 `WorkerEvent`：那会让每个 token 都流经 Scheduler 的确定性事件流，
+ * 污染状态机、放大事件量（踩坑指南铁律 4：高频实时通道必须独立于低频高优先级的共享循环）。
+ * 它只用于「把正在生成的文字实时显示到界面」，不参与任何状态决策。
+ */
+export interface WorkerTranscriptChunk {
+  readonly taskId: TaskId;
+  readonly runGeneration: RunGeneration;
+  readonly delta: string;
+  readonly at: number;
+}

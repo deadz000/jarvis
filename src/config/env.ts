@@ -57,10 +57,16 @@ export const DEFAULT_MAX_CONCURRENT_TASKS = 4;
  */
 export const DASHSCOPE_KEY_ENV_VAR = "DASHSCOPE_API_KEY";
 
+/** 阿里云百炼地域。TTS 的「取消合成」能力需要北京地域。 */
+export const DASHSCOPE_REGIONS = ["cn-beijing", "ap-southeast-1"] as const;
+export type DashScopeRegionName = (typeof DASHSCOPE_REGIONS)[number];
+export const DEFAULT_DASHSCOPE_REGION: DashScopeRegionName = "cn-beijing";
+
 export interface VoiceServiceConfig {
   /** 是否检测到 DashScope 凭据（**不含密钥值**）。字段名刻意不含 credential，否则会被日志脱敏规则误伤。 */
   readonly keyDetected: boolean;
   readonly workspaceId: string | undefined;
+  readonly region: DashScopeRegionName;
   readonly asrModel: string | undefined;
   readonly ttsModel: string | undefined;
   readonly ttsVoice: string | undefined;
@@ -173,6 +179,8 @@ function parseVoiceConfig(env: NodeJS.ProcessEnv): VoiceServiceConfig {
   const asrModel = readOptional(env, "DASHSCOPE_ASR_MODEL") ?? readOptional(env, "ASR_model");
   const ttsModel = readOptional(env, "DASHSCOPE_TTS_MODEL") ?? readOptional(env, "TTS_model");
   const ttsVoice = readOptional(env, "DASHSCOPE_TTS_VOICE");
+  const regionRaw = readOptional(env, "DASHSCOPE_REGION");
+  const region = DASHSCOPE_REGIONS.find((candidate) => candidate === regionRaw) ?? DEFAULT_DASHSCOPE_REGION;
   const enabledRaw = readOptional(env, "JARVIS_VOICE_ENABLED");
   const enabled = enabledRaw === "1" || enabledRaw === "true";
 
@@ -183,7 +191,7 @@ function parseVoiceConfig(env: NodeJS.ProcessEnv): VoiceServiceConfig {
   if (ttsModel === undefined) missing.push("DASHSCOPE_TTS_MODEL");
   if (ttsVoice === undefined) missing.push("DASHSCOPE_TTS_VOICE");
 
-  return { keyDetected, workspaceId, asrModel, ttsModel, ttsVoice, enabled, missing };
+  return { keyDetected, workspaceId, region, asrModel, ttsModel, ttsVoice, enabled, missing };
 }
 
 function detectCredentials(env: NodeJS.ProcessEnv, modelProvider: string | undefined): CredentialStatus {
@@ -246,6 +254,7 @@ export function describeConfig(config: AppConfig): Record<string, unknown> {
     voiceEnabled: config.voice.enabled,
     voiceKeyDetected: config.voice.keyDetected,
     voiceWorkspaceId: config.voice.workspaceId ?? null,
+    voiceRegion: config.voice.region,
     voiceAsrModel: config.voice.asrModel ?? null,
     voiceTtsModel: config.voice.ttsModel ?? null,
     voiceTtsVoice: config.voice.ttsVoice ?? null,

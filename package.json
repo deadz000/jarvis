@@ -16,15 +16,18 @@
     "example:workers": "node --env-file-if-exists=.env examples/sdk/03-two-workers.ts",
     "example:lifecycle": "node --env-file-if-exists=.env examples/sdk/04-session-lifecycle.ts",
     "example:master": "node --env-file-if-exists=.env examples/sdk/05-master-decision.ts",
+    "example:tts": "node --env-file-if-exists=.env examples/sdk/06-tts-smoke.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "1.1.0",
-    "typebox": "1.3.27"
+    "typebox": "1.3.27",
+    "ws": "8.18.3"
   },
   "devDependencies": {
     "@types/node": "24.12.4",
+    "@types/ws": "8.18.1",
     "typescript": "5.9.3",
     "vitest": "5.0.3"
   }

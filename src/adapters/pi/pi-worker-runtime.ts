@@ -15,7 +15,13 @@
  */
 import { createAgentSession, SessionManager, type ModelRuntime } from "@earendil-works/pi-coding-agent";
 
-import type { WorkerEvent, WorkerHandle, WorkerRuntime, WorkerStartRequest } from "../../application/workers/ports.ts";
+import type {
+  WorkerEvent,
+  WorkerHandle,
+  WorkerRuntime,
+  WorkerStartRequest,
+  WorkerTranscriptChunk,
+} from "../../application/workers/ports.ts";
 import { buildWorkerPrompt } from "../../application/workers/worker-prompt.ts";
 import { resolveSpokenText } from "../../application/delivery/spoken-text.ts";
 import type { ThinkingLevel } from "../../config/env.ts";
@@ -48,6 +54,11 @@ export interface PiWorkerRuntimeOptions {
   readonly now?: () => number;
   readonly logger?: Logger;
   readonly maxSummaryLength?: number;
+  /**
+   * 逐 token 文本增量**旁路回调**（高频通道，只用于界面实时显示）。
+   * 它不进入 WorkerEvent / Scheduler，因此不会影响确定性状态机。
+   */
+  readonly onTranscript?: (chunk: WorkerTranscriptChunk) => void;
 }
 
 function truncate(text: string, limit: number): string {
@@ -186,7 +197,19 @@ export class PiWorkerRuntime implements WorkerRuntime {
         return;
       }
       if (type === "message_update") {
-        // 逐 token 增量属于高频通道，不进入 Scheduler 事件流（避免无界事件量）。
+        // 高频通道：逐 token 增量只走旁路回调，不进 Scheduler 事件流。
+        const assistantEvent = (event as Record<string, unknown>)["assistantMessageEvent"];
+        if (typeof assistantEvent === "object" && assistantEvent !== null) {
+          const deltaRecord = assistantEvent as Record<string, unknown>;
+          if (deltaRecord["type"] === "text_delta" && typeof deltaRecord["delta"] === "string") {
+            this.options.onTranscript?.({
+              taskId,
+              runGeneration,
+              delta: deltaRecord["delta"],
+              at: this.now(),
+            });
+          }
+        }
         return;
       }
       logger?.debug("pi_worker.session_event", { taskId, runGeneration, sessionEvent: type });

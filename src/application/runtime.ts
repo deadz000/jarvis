@@ -29,6 +29,7 @@ import { TaskScheduler } from "./scheduler/scheduler.ts";
 import { DeliveryQueue } from "./delivery/delivery-queue.ts";
 import { DeliveryBatcher, type PendingResult } from "./delivery/delivery-batcher.ts";
 import { DeliveryPolicy } from "./delivery/delivery-policy.ts";
+import { TranscriptCoalescer } from "./workers/transcript-coalescer.ts";
 import { SimulatedAudioManager } from "./delivery/audio-manager.ts";
 
 export interface TaskView {
@@ -44,6 +45,8 @@ export interface TaskView {
   readonly resultSummary: string | null;
   /** 口语化播报稿（TTS 实际念的那一段）。 */
   readonly spokenSummary: string | null;
+  /** 正在生成的实时文本（逐 token 合并后的尾部），任务结束后清空。 */
+  readonly liveText: string | null;
   readonly failureReason: string | null;
   readonly cancelReason: string | null;
 }
@@ -95,6 +98,8 @@ export interface JarvisRuntimeOptions {
 }
 
 export const DEFAULT_MAX_TIMELINE_ENTRIES = 200;
+/** 快照里携带的时间线条数上限：避免高频刷新时反复序列化整条历史。 */
+export const SNAPSHOT_TIMELINE_LIMIT = 80;
 
 export class JarvisRuntime {
   private readonly config: AppConfig;
@@ -111,6 +116,12 @@ export class JarvisRuntime {
   private readonly delivery: DeliveryQueue;
   private readonly batcher: DeliveryBatcher;
   private readonly policy = new DeliveryPolicy();
+  /** 文本增量的节流层：高频通道不进 Scheduler，只用于界面实时显示。 */
+  private readonly transcript = new TranscriptCoalescer({
+    onFlush: () => {
+      this.emitUpdate();
+    },
+  });
 
   private readonly listeners = new Set<(snapshot: RuntimeSnapshot) => void>();
   private readonly unsubscribers: Array<() => void> = [];
@@ -133,6 +144,9 @@ export class JarvisRuntime {
       modelRuntime: options.selected.modelRuntime,
       model: options.selected.model,
       workspace: options.config.workspace,
+      onTranscript: (chunk) => {
+        this.transcript.push(chunk.taskId, chunk.delta);
+      },
       ...(options.logger === undefined ? {} : { logger: options.logger }),
     });
 
@@ -223,7 +237,9 @@ export class JarvisRuntime {
       revision: this.world.revision(),
       model: { provider: this.selected.model.provider, id: this.selected.model.id },
       focusTaskId: this.focus.focusedTaskId(),
-      tasks: this.scheduler.listTasks().map(toTaskView),
+      tasks: this.scheduler
+        .listTasks()
+        .map((task) => toTaskView(task, this.transcript.textFor(task.taskId) ?? null)),
       deliveries: this.delivery.items(),
       audio: {
         playing: this.audio.isPlaying,
@@ -233,7 +249,7 @@ export class JarvisRuntime {
         stats: this.audio.stats(),
       },
       lastDecision: this.lastDecision,
-      timeline: [...this.timeline],
+      timeline: this.timeline.slice(-SNAPSHOT_TIMELINE_LIMIT),
       dialogue: this.dialogue.recent(10),
       speechActive: this.speechActive,
     };
@@ -271,6 +287,7 @@ export class JarvisRuntime {
     this.disposed = true;
     for (const unsubscribe of this.unsubscribers) unsubscribe();
     this.batcher.dispose();
+    this.transcript.dispose();
     this.delivery.dispose();
     this.audio.stop("演示结束");
     this.world.dispose();
@@ -297,6 +314,10 @@ export class JarvisRuntime {
               at: Date.now(),
             });
           }
+        }
+        if (event.type === "task_succeeded" || event.type === "task_failed" || event.type === "task_cancelled") {
+          // 任务终态：实时文本让位给正式结果，清掉高频缓冲
+          this.transcript.clear(event.taskId);
         }
         this.emitUpdate();
       }),
@@ -394,21 +415,24 @@ export class JarvisRuntime {
   }
 }
 
-function toTaskView(task: {
-  taskId: string;
-  goal: string;
-  state: TaskState;
-  runGeneration: number;
-  priority: Priority;
-  createdAt: number;
-  startedAt?: number;
-  terminalAt?: number;
-  lastActivityAt: number;
-  resultSummary?: string;
-  spokenSummary?: string;
-  failureReason?: string;
-  cancelReason?: string;
-}): TaskView {
+function toTaskView(
+  task: {
+    taskId: string;
+    goal: string;
+    state: TaskState;
+    runGeneration: number;
+    priority: Priority;
+    createdAt: number;
+    startedAt?: number;
+    terminalAt?: number;
+    lastActivityAt: number;
+    resultSummary?: string;
+    spokenSummary?: string;
+    failureReason?: string;
+    cancelReason?: string;
+  },
+  liveText: string | null,
+): TaskView {
   return {
     taskId: task.taskId,
     goal: task.goal,
@@ -421,6 +445,7 @@ function toTaskView(task: {
     lastActivityAt: task.lastActivityAt,
     resultSummary: task.resultSummary ?? null,
     spokenSummary: task.spokenSummary ?? null,
+    liveText,
     failureReason: task.failureReason ?? null,
     cancelReason: task.cancelReason ?? null,
   };
