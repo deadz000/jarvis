@@ -35,7 +35,7 @@ function frame(capturedAt: number): ScreenFrame {
 }
 
 function input(frames = [frame(0), frame(5_000), frame(10_000)]): ScreenSummarizeInput {
-  return { frames, image: IMAGE };
+  return { frames, images: [IMAGE, IMAGE, IMAGE] };
 }
 
 function jsonResponse(payload: unknown, status = 200): Response {
@@ -64,7 +64,7 @@ describe("Responses API 文本提取", () => {
 });
 
 describe("OpenAiResponsesVisionSummarizer", () => {
-  it("使用 Responses API 的 input_image 格式发送图片", async () => {
+  it("使用 Responses API 的 input_image 格式发送**整批多张**图片，且按时间顺序", async () => {
     let capturedUrl: string | undefined;
     let capturedBody: unknown;
 
@@ -85,12 +85,33 @@ describe("OpenAiResponsesVisionSummarizer", () => {
     const body = capturedBody as { input: Array<{ content: Array<Record<string, unknown>> }> };
     const parts = body.input[0]?.content ?? [];
     expect(parts.some((part) => part["type"] === "input_text")).toBe(true);
-    const imagePart = parts.find((part) => part["type"] === "input_image");
-    expect(imagePart?.["image_url"]).toBe("data:image/jpeg;base64,AAAA");
+    const imageParts = parts.filter((part) => part["type"] === "input_image");
+    // 整批 3 张都发出去（旧设计只发 1 张）
+    expect(imageParts).toHaveLength(3);
+    expect(imageParts[0]?.["image_url"]).toBe("data:image/jpeg;base64,AAAA");
 
     expect(summary.fromModel).toBe(true);
     expect(summary.text).toBe("用户正在查看一份文档。");
     expect(summary.frameCount).toBe(3);
+  });
+
+  it("没有可用图时不发请求，直接给确定性摘要（省钱且诚实）", async () => {
+    let called = 0;
+    const summarizer = new OpenAiResponsesVisionSummarizer({
+      baseUrl: "https://example.test/v1",
+      apiKey: "test-key",
+      model: "vision-model",
+      fetchImpl: () => {
+        called += 1;
+        return Promise.resolve(jsonResponse({ output_text: "不应被调用" }));
+      },
+    });
+
+    const summary = await summarizer.summarize({ frames: [frame(0)], images: [] });
+
+    expect(called).toBe(0);
+    expect(summary.fromModel).toBe(false);
+    expect(summary.text).toContain("没有可用的截图");
   });
 
   it("HTTP 非 2xx 时报错（由兜底层处理，不静默成功）", async () => {
@@ -140,7 +161,7 @@ describe("确定性兜底摘要", () => {
   });
 
   it("空帧数组不会抛错", async () => {
-    const summary = await new DeterministicScreenSummarizer().summarize({ frames: [], image: IMAGE });
+    const summary = await new DeterministicScreenSummarizer().summarize({ frames: [], images: [] });
 
     expect(summary.text).toContain("未知");
   });

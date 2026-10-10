@@ -16,10 +16,14 @@
 import type { Logger } from "../../observability/logger.ts";
 import { deterministicScreenSummary } from "../../application/screen/deterministic-summary.ts";
 import type {
+  ScreenImage,
   ScreenSummarizeInput,
   ScreenSummarizerPort,
   ScreenSummary,
 } from "../../application/screen/screen-port.ts";
+
+/** 一次请求最多送几张图（与攒批上限一致）。 */
+export const MAX_IMAGES_PER_REQUEST = 3;
 
 /** 摘要文本上限（防止模型啰嗦把滑动窗口撑大）。 */
 export const MAX_SCREEN_SUMMARY_LENGTH = 200;
@@ -27,21 +31,39 @@ export const DEFAULT_VISION_TIMEOUT_MS = 20_000;
 /**
  * 输出 token 上限。
  *
- * 实测教训：给 200 时模型把预算花在推理上，返回
- * `incomplete_details: {reason: "length"}` 且**没有可见文本**。
- * 这里留足余量；同时错误信息会带上 incomplete_details，便于下次快速定位。
+ * 实测教训（两次都踩到）：
+ * - 给 200 时模型把预算花在推理上，返回 `incomplete_details: {reason:"length"}` 且**没有可见文本**；
+ * - 给 800 时**单张图**够用，但**发 3 张图时又不够**（图越多推理越长）。
+ *
+ * 因此这里给足余量。错误信息会带上 incomplete_details 与当前上限值，
+ * 便于下次直接定位而不是靠猜。
  */
-export const DEFAULT_MAX_OUTPUT_TOKENS = 800;
+export const DEFAULT_MAX_OUTPUT_TOKENS = 4_000;
 
 export const SCREEN_SUMMARY_INSTRUCTION = [
-  "你在为一位语音助手提供「屏幕上下文摘要」。下面这张图是用户当前的屏幕。",
-  "请用 1-2 句中文说明：用户此刻在做什么、当前焦点是什么。",
+  "你在为一位语音助手提供「屏幕上下文摘要」。",
+  "下面会按**时间顺序**给出同一台电脑在最近一小段时间内的若干张截图（最多 3 张）。",
+  "请用 1-2 句中文说明：用户此刻在做什么、当前焦点是什么；",
+  "如果这几张图之间发生了明显变化（比如从编辑代码切到了浏览器），也要点出来。",
   "要求：",
   "- 只写能从画面确认的内容；",
   "- 不要猜测用户意图，不要评价，不要给建议；",
   "- 抓重点，不要罗列界面元素细节；",
   "- 如果画面没有可描述的内容（例如空白桌面），直接说明「屏幕为空白桌面」。",
 ].join("\n");
+
+/**
+ * 把图片按时间顺序拼成 Responses API 的 content 数组。
+ *
+ * 顺序很重要：提示词要求模型描述"这几张之间的变化"，
+ * 因此必须**严格按捕获时间升序**送入，而不是任意顺序。
+ */
+export function buildImageContentParts(images: readonly ScreenImage[]): Array<Record<string, string>> {
+  return images.map((image) => ({
+    type: "input_image",
+    image_url: `data:image/jpeg;base64,${image.jpegBase64}`,
+  }));
+}
 
 export interface VisionSummarizerOptions {
   readonly baseUrl: string;
@@ -98,6 +120,11 @@ export class OpenAiResponsesVisionSummarizer implements ScreenSummarizerPort {
   }
 
   public async summarize(input: ScreenSummarizeInput): Promise<ScreenSummary> {
+    // 没有可用图时不发请求：只用数值帧生成确定性摘要（省钱且诚实）
+    if (input.images.length === 0) {
+      return deterministicScreenSummary(input.frames, this.now(), "该批次没有可用的截图");
+    }
+
     const controller = new AbortController();
     const timeoutMs = this.options.timeoutMs ?? DEFAULT_VISION_TIMEOUT_MS;
     const timer = setTimeout(() => {
@@ -105,6 +132,12 @@ export class OpenAiResponsesVisionSummarizer implements ScreenSummarizerPort {
     }, timeoutMs);
 
     try {
+      const content = [
+        { type: "input_text", text: SCREEN_SUMMARY_INSTRUCTION },
+        // 最多 3 张，**按时间升序**（提示词依赖这个顺序描述变化）
+        ...buildImageContentParts(input.images.slice(0, MAX_IMAGES_PER_REQUEST)),
+      ];
+
       const response = await this.fetchImpl(`${this.options.baseUrl}/responses`, {
         method: "POST",
         headers: {
@@ -113,18 +146,7 @@ export class OpenAiResponsesVisionSummarizer implements ScreenSummarizerPort {
         },
         body: JSON.stringify({
           model: this.options.model,
-          input: [
-            {
-              role: "user",
-              content: [
-                { type: "input_text", text: SCREEN_SUMMARY_INSTRUCTION },
-                {
-                  type: "input_image",
-                  image_url: `data:image/jpeg;base64,${input.image.jpegBase64}`,
-                },
-              ],
-            },
-          ],
+          input: [{ role: "user", content }],
           max_output_tokens: this.options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
         }),
         signal: controller.signal,

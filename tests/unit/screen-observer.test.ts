@@ -4,8 +4,10 @@ import { ScreenMemory } from "../../src/application/screen/screen-memory.ts";
 import { ScreenObserver, type ScreenObserverEvent } from "../../src/application/screen/screen-observer.ts";
 import { deterministicScreenSummary } from "../../src/application/screen/deterministic-summary.ts";
 import type {
+  PersistedFrameRef,
   ScreenCapturePort,
   ScreenFrame,
+  ScreenFrameStorePort,
   ScreenImage,
   ScreenImagePort,
   ScreenSummarizeInput,
@@ -69,7 +71,65 @@ class FakeImage implements ScreenImagePort {
   public captureImage(): Promise<ScreenImage> {
     this.calls += 1;
     if (this.fails) return Promise.reject(new Error("图像探针失败"));
-    return Promise.resolve({ jpegBase64: "AAAA", width: 1_024, height: 576, capturedAt: 0, byteLength: 4 });
+    return Promise.resolve({ jpegBase64: "AAAA", width: 1_024, height: 576, capturedAt: this.calls, byteLength: 4 });
+  }
+}
+
+/** 内存版帧存储：记录落盘/删除调用，验证"帧只短暂存在"。 */
+class FakeFrameStore implements ScreenFrameStorePort {
+  public readonly saved: PersistedFrameRef[] = [];
+  public readonly deleted: PersistedFrameRef[] = [];
+  public cleanupCalls = 0;
+  public readFails = false;
+  public saveFails = false;
+  private counter = 0;
+
+  public save(image: ScreenImage): Promise<PersistedFrameRef> {
+    if (this.saveFails) return Promise.reject(new Error("落盘失败"));
+    this.counter += 1;
+    const ref: PersistedFrameRef = {
+      path: `/fake/frame-${String(this.counter)}.jpg`,
+      width: image.width,
+      height: image.height,
+      byteLength: image.byteLength,
+      capturedAt: image.capturedAt,
+    };
+    this.saved.push(ref);
+    return Promise.resolve(ref);
+  }
+
+  public read(ref: PersistedFrameRef): Promise<ScreenImage> {
+    if (this.readFails) return Promise.reject(new Error("读失败"));
+    return Promise.resolve({
+      jpegBase64: "BBBB",
+      width: ref.width,
+      height: ref.height,
+      capturedAt: ref.capturedAt,
+      byteLength: ref.byteLength,
+    });
+  }
+
+  public remove(refs: readonly PersistedFrameRef[]): Promise<number> {
+    this.deleted.push(...refs);
+    return Promise.resolve(refs.length);
+  }
+
+  public cleanupOrphans(): Promise<number> {
+    this.cleanupCalls += 1;
+    return Promise.resolve(0);
+  }
+
+  public pendingCount(): Promise<number> {
+    return Promise.resolve(this.saved.length - this.deleted.length);
+  }
+}
+
+/** 让 fire-and-forget 的异步删除跑完。 */
+async function settle(times = 10): Promise<void> {
+  for (let index = 0; index < times; index += 1) {
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
   }
 }
 
@@ -92,22 +152,35 @@ function setup(options: { frames: ScreenFrame[]; imageFails?: boolean; summarize
   const capture = new ScriptedCapture(options.frames);
   const image = new FakeImage();
   if (options.imageFails === true) image.fails = true;
+  const frameStore = new FakeFrameStore();
   const summarizer = new RecordingSummarizer();
   if (options.summarizerText !== undefined) summarizer.text = options.summarizerText;
   const memory = new ScreenMemory();
   const events: ScreenObserverEvent[] = [];
 
+  let currentTime = 0;
   const observer = new ScreenObserver({
     capture,
     image,
+    frameStore,
     summarizer,
     memory,
     now: () => currentTime,
     onEvent: (event) => events.push(event),
   });
 
-  let currentTime = 0;
-  return { observer, capture, image, summarizer, memory, events, setTime: (value: number) => { currentTime = value; } };
+  return {
+    observer,
+    capture,
+    image,
+    frameStore,
+    summarizer,
+    memory,
+    events,
+    setTime: (value: number) => {
+      currentTime = value;
+    },
+  };
 }
 
 /**
@@ -134,16 +207,18 @@ function changedFrame(step: number, capturedAt: number): ScreenFrame {
 }
 
 describe("ScreenObserver —— 常驻观察循环", () => {
-  it("首帧建立基线并进入攒批，未满 3 帧不出批", async () => {
+  it("首帧建立基线并进入攒批，未满 3 帧不出批（但已落盘）", async () => {
     const h = setup({ frames: [makeFrame({ capturedAt: 0 })] });
     await h.observer.pollOnce();
 
     expect(h.observer.pendingFrames()).toBe(1);
     expect(h.summarizer.calls).toHaveLength(0);
-    expect(h.image.calls).toBe(0);
+    // 新设计：判定有效即物化并落盘（不再等出批）
+    expect(h.image.calls).toBe(1);
+    expect(h.frameStore.saved).toHaveLength(1);
   });
 
-  it("攒满 3 帧后物化图像并调一次摘要，写入滑动窗口", async () => {
+  it("攒满 3 帧后把**整批多张图**交给摘要，然后删除这些帧", async () => {
     const h = setup({ frames: [makeFrame({ capturedAt: 0 })] });
     await h.observer.pollOnce(); // 首帧 → 基线
 
@@ -151,15 +226,18 @@ describe("ScreenObserver —— 常驻观察循环", () => {
     h.setTime(10_000);
     await h.observer.pollOnce();
     h.setTime(20_000);
-    await h.observer.pollOnce();
+    await h.observer.pollOnce(); // 第 3 帧 → 出批
     h.setTime(30_000);
     await h.observer.pollOnce();
 
-    expect(h.image.calls).toBe(1);
     expect(h.summarizer.calls).toHaveLength(1);
     expect(h.summarizer.calls[0]?.frames).toHaveLength(3);
+    expect(h.summarizer.calls[0]?.images).toHaveLength(3);
     expect(h.memory.size()).toBe(1);
     expect(h.observer.stats().summarized).toBe(1);
+    // 该批 3 张全部删除；第 4 帧仍在待批
+    expect(h.frameStore.deleted).toHaveLength(3);
+    expect(h.frameStore.saved).toHaveLength(4);
   });
 
   it("被节流/双条件拒绝的帧不进入攒批", async () => {
@@ -191,7 +269,7 @@ describe("ScreenObserver —— 常驻观察循环", () => {
     expect(h.events.some((event) => event.type === "screen_error")).toBe(true);
   });
 
-  it("图像物化失败时**不丢观察**：落一条确定性摘要", async () => {
+  it("图像物化失败时**不丢观察**：该批仍产生摘要（只是没有图）", async () => {
     const h = setup({ frames: [makeFrame({ capturedAt: 0 })], imageFails: true });
     await h.observer.pollOnce();
 
@@ -203,11 +281,11 @@ describe("ScreenObserver —— 常驻观察循环", () => {
     h.setTime(30_000);
     await h.observer.pollOnce();
 
-    expect(h.summarizer.calls).toHaveLength(0); // 没有图，不调模型
+    expect(h.frameStore.saved).toHaveLength(0); // 一张都没落盘
+    expect(h.summarizer.calls).toHaveLength(1); // 但摘要照样发生
+    expect(h.summarizer.calls[0]?.frames).toHaveLength(3);
+    expect(h.summarizer.calls[0]?.images).toHaveLength(0);
     expect(h.memory.size()).toBe(1);
-    const entries = h.memory.recent(30_000);
-    expect(entries[0]?.fromModel).toBe(false);
-    expect(entries[0]?.text).toContain("图像采集失败");
   });
 
   it("防重入：上一轮未结束时跳过本轮", async () => {
@@ -223,6 +301,7 @@ describe("ScreenObserver —— 常驻观察循环", () => {
     const observer = new ScreenObserver({
       capture: slowCapture,
       image: new FakeImage(),
+      frameStore: new FakeFrameStore(),
       summarizer: new RecordingSummarizer(),
       memory: new ScreenMemory(),
       onEvent: (event) => events.push(event),
@@ -257,6 +336,89 @@ describe("ScreenObserver —— 常驻观察循环", () => {
     h.observer.stop();
     expect(h.observer.running).toBe(false);
     h.observer.stop(); // 重复 stop 不抛错
+  });
+});
+
+describe("屏幕帧的落盘生命周期（帧只短暂存在于磁盘）", () => {
+  it("有效帧才落盘，摘要完成后立即全部删除", async () => {
+    const h = setup({ frames: [makeFrame({ capturedAt: 0 })] });
+
+    // 基线 + 2 次变化 = 3 帧，正好填满一批
+    h.capture.frames.push(changedFrame(1, 10_000), changedFrame(2, 20_000));
+    await h.observer.pollOnce();
+    h.setTime(10_000);
+    await h.observer.pollOnce();
+    h.setTime(20_000);
+    await h.observer.pollOnce();
+
+    expect(h.frameStore.saved).toHaveLength(3);
+    // 摘要落库后，3 张全部删除，磁盘上不再有待摘要帧
+    expect(h.frameStore.deleted).toHaveLength(3);
+    await expect(h.frameStore.pendingCount()).resolves.toBe(0);
+    expect(h.observer.stats().deletedFrames).toBe(3);
+  });
+
+  it("被拒绝的帧不落盘（双条件不通过就不物化、不写盘、不调模型）", async () => {
+    const h = setup({ frames: [makeFrame({ capturedAt: 0 })] });
+    await h.observer.pollOnce();
+    const savedAfterFirst = h.frameStore.saved.length;
+
+    h.setTime(1_000); // 1s 后同一帧 → 节流拒绝
+    await h.observer.pollOnce();
+
+    expect(h.frameStore.saved).toHaveLength(savedAfterFirst);
+    expect(h.image.calls).toBe(savedAfterFirst);
+  });
+
+  it("stop() 删除未满批的落盘帧（关闭即不留残余）", async () => {
+    const h = setup({ frames: [makeFrame({ capturedAt: 0 })] });
+    h.observer.start();
+    await settle(); // 等 start() 触发的那一轮采集完成
+
+    expect(h.frameStore.saved).toHaveLength(1);
+    expect(h.observer.pendingFrames()).toBe(1);
+
+    h.observer.stop();
+    await settle();
+
+    expect(h.frameStore.deleted).toHaveLength(1);
+    expect(h.observer.pendingFrames()).toBe(0);
+  });
+
+  it("start() 会清理上次崩溃遗留的孤儿帧", async () => {
+    const h = setup({ frames: [makeFrame({ capturedAt: 0 })] });
+    h.observer.start();
+    await settle();
+
+    expect(h.frameStore.cleanupCalls).toBeGreaterThan(0);
+  });
+
+  it("单张图读取失败只少一张，不中断整批摘要", async () => {
+    const h = setup({ frames: [makeFrame({ capturedAt: 0 })] });
+    await h.observer.pollOnce();
+    h.frameStore.readFails = true;
+
+    h.capture.frames.push(changedFrame(1, 10_000), changedFrame(2, 20_000), changedFrame(3, 30_000));
+    h.setTime(10_000);
+    await h.observer.pollOnce();
+    h.setTime(20_000);
+    await h.observer.pollOnce();
+    h.setTime(30_000);
+    await h.observer.pollOnce();
+
+    // 图读不出来 → 该批没有可用图 → 仍产生摘要（确定性兜底），且帧仍被删除
+    expect(h.summarizer.calls[0]?.images).toHaveLength(0);
+    expect(h.frameStore.deleted).toHaveLength(3);
+  });
+
+  it("落盘失败不丢观察：该帧仍进批次（只是这批少一张图）", async () => {
+    const h = setup({ frames: [makeFrame({ capturedAt: 0 })] });
+    h.frameStore.saveFails = true;
+    await h.observer.pollOnce();
+
+    expect(h.frameStore.saved).toHaveLength(0);
+    expect(h.observer.pendingFrames()).toBe(1); // 帧仍在批次里
+    expect(h.events.some((event) => event.type === "screen_error")).toBe(true);
   });
 });
 

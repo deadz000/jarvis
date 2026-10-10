@@ -21,6 +21,7 @@ import {
 } from "./adapters/vision/openai-responses-vision-summarizer.ts";
 import { WindowsScreenCapture } from "./adapters/windows/windows-screen-capture.ts";
 import { WindowsScreenImage } from "./adapters/windows/windows-screen-image.ts";
+import { FileScreenFrameStore } from "./adapters/fs/file-screen-frame-store.ts";
 import { SqliteStore } from "./adapters/sqlite/sqlite-store.ts";
 import type { ScreenFilterOptions } from "./application/screen/screen-filter.ts";
 import type { PersistencePort } from "./application/storage/store-port.ts";
@@ -228,6 +229,8 @@ function buildScreenWiring(config: AppConfig, log: Logger): ScreenWiringOptions 
   const baseUrl = readProviderBaseUrl(config);
   const screenOverrides = readScreenOverrides();
   const pollMs = readScreenPollMs();
+  const dataDir = process.env["JARVIS_DATA_DIR"] ?? join(config.workspace, ".data");
+  const frameDir = process.env["JARVIS_SCREEN_FRAME_DIR"] ?? join(dataDir, "screen-frames");
   if (apiKey === undefined || baseUrl === undefined || config.modelId === undefined) {
     log.warn("app.screen.unavailable", {
       hint: "无法确定多模态摘要所需的端点/密钥/模型，屏幕观察不可用",
@@ -243,12 +246,15 @@ function buildScreenWiring(config: AppConfig, log: Logger): ScreenWiringOptions 
     model: config.modelId,
     thresholdsOverridden: screenOverrides ?? null,
     pollIntervalMs: pollMs ?? null,
-    note: "默认关闭，需显式开启；摘要会把一张约 35KB 的 JPEG 发送给模型",
+    frameDir,
+    note: "默认关闭，需显式开启；有效帧会短暂落盘，摘要完成后立即删除",
   });
 
   return {
     capture: new WindowsScreenCapture(config.workspace, { logger: log }),
     image: new WindowsScreenImage(config.workspace, { logger: log }),
+    // 帧落盘：磁盘是"待摘要帧"的临时缓冲，摘要完成即删除（见决策清单）
+    frameStore: new FileScreenFrameStore({ directory: frameDir, logger: log }),
     summarizer: new FallbackScreenSummarizer(
       new OpenAiResponsesVisionSummarizer({
         baseUrl,

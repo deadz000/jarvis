@@ -19,11 +19,11 @@ export interface ScreenSummaryBatcherOptions {
   readonly maxWindowMs?: number;
 }
 
-export class ScreenSummaryBatcher {
+export class ScreenSummaryBatcher<T = ScreenFrame> {
   private readonly batchSize: number;
   private readonly maxWindowMs: number;
 
-  private frames: ScreenFrame[] = [];
+  private items: T[] = [];
   private firstAt = 0;
 
   public constructor(options: ScreenSummaryBatcherOptions = {}) {
@@ -31,36 +31,36 @@ export class ScreenSummaryBatcher {
     this.maxWindowMs = options.maxWindowMs ?? DEFAULT_SCREEN_BATCH_MAX_WINDOW_MS;
   }
 
-  /** 加入一帧；达到阈值时返回该批帧，否则返回 null。 */
-  public add(frame: ScreenFrame, now: number): readonly ScreenFrame[] | null {
-    if (this.frames.length === 0) this.firstAt = now;
-    this.frames.push(frame);
+  /** 加入一项；达到阈值时返回该批，否则返回 null。 */
+  public add(item: T, now: number): readonly T[] | null {
+    if (this.items.length === 0) this.firstAt = now;
+    this.items.push(item);
 
-    if (this.frames.length >= this.batchSize) return this.take();
+    if (this.items.length >= this.batchSize) return this.take();
     if (now - this.firstAt >= this.maxWindowMs) return this.take();
     return null;
   }
 
   /** 取出当前批次（不足阈值时用于「关闭前的收尾」）。 */
-  public take(): readonly ScreenFrame[] {
-    const batch = this.frames;
-    this.frames = [];
+  public take(): readonly T[] {
+    const batch = this.items;
+    this.items = [];
     this.firstAt = 0;
     return batch;
   }
 
   public pendingCount(): number {
-    return this.frames.length;
+    return this.items.length;
   }
 
-  /** 距首帧已等待多久（用于观察是否卡在窗口上）。 */
+  /** 距首项已等待多久（用于观察是否卡在窗口上）。 */
   public ageMs(now: number): number {
-    return this.frames.length === 0 ? 0 : now - this.firstAt;
+    return this.items.length === 0 ? 0 : now - this.firstAt;
   }
 
-  /** 清空（关闭屏幕观察时调用；未满批的帧直接丢弃，不做摘要）。 */
+  /** 清空（关闭屏幕观察时调用；未满批的帧交由调用方处理删除）。 */
   public reset(): void {
-    this.frames = [];
+    this.items = [];
     this.firstAt = 0;
   }
 }

@@ -37,6 +37,7 @@ import { ScreenObserver, type ScreenObserverEvent } from "./screen/screen-observ
 import { ScreenChangeFilter, type ScreenFilterOptions } from "./screen/screen-filter.ts";
 import type {
   ScreenCapturePort,
+  ScreenFrameStorePort,
   ScreenImagePort,
   ScreenSummarizerPort,
 } from "./screen/screen-port.ts";
@@ -168,6 +169,8 @@ export interface JarvisRuntimeOptions {
 export interface ScreenWiringOptions {
   readonly capture: ScreenCapturePort;
   readonly image: ScreenImagePort;
+  /** 帧落盘：把有效帧暂存到磁盘，供整批多图摘要使用，摘要后删除。 */
+  readonly frameStore: ScreenFrameStorePort;
   readonly summarizer: ScreenSummarizerPort;
   readonly pollIntervalMs?: number;
   /**
@@ -324,6 +327,7 @@ export class JarvisRuntime {
         : new ScreenObserver({
             capture: options.screen.capture,
             image: options.screen.image,
+            frameStore: options.screen.frameStore,
             summarizer: options.screen.summarizer,
             memory: this.screenMemory,
             ...(options.screen.filterOptions === undefined
@@ -490,10 +494,22 @@ export class JarvisRuntime {
   private onScreenEvent(event: ScreenObserverEvent): void {
     switch (event.type) {
       case "screen_started":
-        this.pushTimeline("screen_started", "屏幕观察已开启（5s 节流 · 双条件过滤 · 帧不落盘）");
+        this.pushTimeline(
+          "screen_started",
+          "屏幕观察已开启（双条件过滤 · 节流 · 有效帧短暂落盘待摘要，摘要后立即删除）",
+        );
         break;
       case "screen_stopped":
-        this.pushTimeline("screen_stopped", "屏幕观察已关闭（未满批的帧已丢弃）");
+        this.pushTimeline(
+          "screen_stopped",
+          `屏幕观察已关闭（丢弃 ${String(event.discardedFrames)} 个未满批的帧及其落盘文件）`,
+        );
+        break;
+      case "screen_startup_cleanup":
+        this.pushTimeline(
+          "screen_cleanup",
+          `启动清理：删除 ${String(event.removed)} 张上次崩溃遗留的待摘要帧`,
+        );
         break;
       case "screen_frame_admitted":
         this.pushTimeline(
@@ -503,7 +519,10 @@ export class JarvisRuntime {
         );
         break;
       case "screen_batch_ready":
-        this.pushTimeline("screen_batch", `${String(event.frameCount)} 帧出批，准备多模态摘要`);
+        this.pushTimeline(
+          "screen_batch",
+          `${String(event.frameCount)} 帧出批（${String(event.imageCount)} 张图）→ 多模态摘要`,
+        );
         break;
       case "screen_summarized":
         this.lastScreenSummary = event.text;

@@ -14,8 +14,7 @@
  * 那是显式动作，不属于持续观察。
  */
 
-/** 采集探针的原始输出（.NET 侧只做机械降采样，不做任何决策）。 */
-export interface ScreenProbeSample {
+/** 采集探针的原始输出（.NET 侧只做机械降采样，不做任何决策）。 */export interface ScreenProbeSample {
   readonly ok: boolean;
   readonly error?: string;
   readonly width: number;
@@ -83,10 +82,48 @@ export interface ScreenImagePort {
   captureImage(): Promise<ScreenImage>;
 }
 
+/**
+ * 已落盘的一帧图像引用。
+ *
+ * ## 生命周期（**用完即删**）
+ * 被判定为"有效变化"的帧 → 落盘 → 参与攒批 → 发给模型摘要 →
+ * **摘要落库后立即删除对应文件**。
+ *
+ * 也就是说磁盘只是**待摘要帧的临时缓冲**，不是帧仓库：
+ * 帧的持久存在时间上界 ≈ 攒批窗口（最长 5 分钟）。
+ * 进程崩溃留下的孤儿帧会在下次启动时清理。
+ */
+export interface PersistedFrameRef {
+  /** 绝对路径。 */
+  readonly path: string;
+  readonly width: number;
+  readonly height: number;
+  readonly byteLength: number;
+  readonly capturedAt: number;
+}
+
+export interface ScreenFrameStorePort {
+  /** 把一帧图像落盘，返回引用。 */
+  save(image: ScreenImage): Promise<PersistedFrameRef>;
+  /** 读回（用于发给模型）。文件不存在时抛错，由调用方决定降级。 */
+  read(ref: PersistedFrameRef): Promise<ScreenImage>;
+  /** 删除这些帧（摘要落库后调用）。返回实际删除的数量。 */
+  remove(refs: readonly PersistedFrameRef[]): Promise<number>;
+  /** 清理孤儿帧（进程崩溃遗留），返回清理数量。 */
+  cleanupOrphans(): Promise<number>;
+  /** 当前待摘要帧数量（用于面板与排查）。 */
+  pendingCount(): Promise<number>;
+}
+
 export interface ScreenSummarizeInput {
   readonly frames: readonly ScreenFrame[];
-  /** 代表性图片（通常取该批最后一帧，最接近"现在"）。 */
-  readonly image: ScreenImage;
+  /**
+   * 该批的图片，**按时间顺序**，最多 3 张。
+   *
+   * 与旧设计的区别：以前只发"最近一张"，现在把整批都发给模型 ——
+   * 这样才能看出"这 5 分钟里屏幕是怎么变化的"，而不只是"最后一刻长什么样"。
+   */
+  readonly images: readonly ScreenImage[];
 }
 
 export interface ScreenSummarizerPort {
