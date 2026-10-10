@@ -15,6 +15,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { join } from "node:path";
 
 import type { JarvisRuntime, RuntimeSnapshot } from "../../application/runtime.ts";
+import type { DeliveredAudioChunk } from "../../application/delivery/audio-manager.ts";
 import type { Logger } from "../../observability/logger.ts";
 
 export interface DemoServerOptions {
@@ -58,6 +59,7 @@ export class DemoServer {
   private readonly sseClients = new Set<ServerResponse>();
   private server: Server | undefined;
   private unsubscribeRuntime: (() => void) | undefined;
+  private unsubscribeAudio: (() => void) | undefined;
   private heartbeat: NodeJS.Timeout | undefined;
 
   public constructor(options: DemoServerOptions) {
@@ -73,6 +75,10 @@ export class DemoServer {
 
     this.unsubscribeRuntime = this.options.runtime.onUpdate((snapshot) => {
       this.broadcast(snapshot);
+    });
+    // 真实音频分片走独立的 SSE 事件类型（base64 PCM），与快照分开以免互相拖累
+    this.unsubscribeAudio = this.options.runtime.onAudioChunk((chunk) => {
+      this.broadcastAudio(chunk);
     });
 
     const heartbeatMs = this.options.heartbeatMs ?? 15_000;
@@ -92,6 +98,7 @@ export class DemoServer {
 
   public async stop(): Promise<void> {
     this.unsubscribeRuntime?.();
+    this.unsubscribeAudio?.();
     if (this.heartbeat !== undefined) clearInterval(this.heartbeat);
     for (const client of this.sseClients) client.end();
     this.sseClients.clear();
@@ -197,6 +204,25 @@ export class DemoServer {
   private broadcast(snapshot: RuntimeSnapshot): void {
     if (this.sseClients.size === 0) return;
     const payload = `data: ${JSON.stringify(snapshot)}\n\n`;
+    for (const client of this.sseClients) client.write(payload);
+  }
+
+  /**
+   * 推送一段真实音频分片。带 `token`，浏览器可据此拒绝旧代次的分片
+   * （服务端已拒绝过一次，这是第二道保险）。
+   */
+  private broadcastAudio(chunk: DeliveredAudioChunk): void {
+    if (this.sseClients.size === 0) return;
+    const payload =
+      `event: audio\n` +
+      `data: ${JSON.stringify({
+        token: chunk.token,
+        taskId: chunk.taskId,
+        index: chunk.index,
+        format: chunk.format,
+        sampleRate: chunk.sampleRate,
+        pcm: chunk.audio.toString("base64"),
+      })}\n\n`;
     for (const client of this.sseClients) client.write(payload);
   }
 }

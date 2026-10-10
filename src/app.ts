@@ -9,9 +9,11 @@
  */
 import { join } from "node:path";
 
+import { DashScopeTtsAdapter } from "./adapters/dashscope/tts-adapter.ts";
 import { DemoServer } from "./adapters/http/demo-server.ts";
 import { selectModel } from "./adapters/pi/model-selection.ts";
 import { JarvisRuntime } from "./application/runtime.ts";
+import type { TtsPort } from "./application/delivery/tts-port.ts";
 import { assertModelCredentials, ConfigError, describeConfig, loadConfig, type AppConfig } from "./config/env.ts";
 import { createLogger, type Logger } from "./observability/logger.ts";
 
@@ -88,9 +90,60 @@ async function main(argv: readonly string[]): Promise<number> {
   return 0;
 }
 
+/** 真实 TTS 的输出采样率；与前端 AudioContext 构造一致，避免重采样。 */
+const TTS_SAMPLE_RATE = 24_000;
+
+/**
+ * 组合根：根据配置决定用真实 TTS 还是模拟音频。
+ * 运行时本身不接触密钥，只有这里读取进程环境。
+ */
+function buildTtsAdapter(config: AppConfig, log: Logger): TtsPort | undefined {
+  const voice = config.voice;
+
+  if (!voice.enabled) {
+    log.info("app.voice.disabled", {
+      hint: "设置 JARVIS_VOICE_ENABLED=1 启用真实 TTS；当前使用模拟音频分片（零成本）",
+    });
+    return undefined;
+  }
+
+  const apiKey = process.env["DASHSCOPE_API_KEY"];
+  if (
+    apiKey === undefined ||
+    voice.workspaceId === undefined ||
+    voice.ttsModel === undefined ||
+    voice.ttsVoice === undefined
+  ) {
+    log.warn("app.voice.incomplete", {
+      missing: voice.missing,
+      hint: "语音已启用但配置不完整，回退为模拟音频",
+    });
+    return undefined;
+  }
+
+  log.info("app.voice.enabled", {
+    model: voice.ttsModel,
+    voice: voice.ttsVoice,
+    region: voice.region,
+    format: "pcm",
+    sampleRate: TTS_SAMPLE_RATE,
+  });
+
+  return new DashScopeTtsAdapter({
+    apiKey,
+    workspaceId: voice.workspaceId,
+    model: voice.ttsModel,
+    voice: voice.ttsVoice,
+    region: voice.region,
+    format: "pcm",
+    sampleRate: TTS_SAMPLE_RATE,
+    logger: log,
+  });
+}
+
 /**
  * 演示模式（Milestone Alpha）：启动可视化面板，把聊天 → Master → Scheduler →
- * 真实 Worker → 结果 → 交付队列 → 模拟音频仲裁整条链路跑起来。
+ * 真实 Worker → 结果 → 交付队列 → 音频仲裁（模拟或真实 TTS）整条链路跑起来。
  */
 async function runDemo(config: AppConfig, log: Logger): Promise<number> {
   assertModelCredentials(config);
@@ -100,7 +153,13 @@ async function runDemo(config: AppConfig, log: Logger): Promise<number> {
     availableCount: selected.availableCount,
   });
 
-  const runtime = new JarvisRuntime({ config, selected, logger: log });
+  const tts = buildTtsAdapter(config, log);
+  const runtime = new JarvisRuntime({
+    config,
+    selected,
+    logger: log,
+    ...(tts === undefined ? {} : { tts }),
+  });
   const rawPort = process.env["JARVIS_DEMO_PORT"];
   const port = rawPort === undefined ? DEFAULT_DEMO_PORT : Number(rawPort);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {

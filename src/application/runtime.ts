@@ -11,7 +11,6 @@
  */
 import type { AppConfig } from "../config/env.ts";
 import type { SchedulerEvent } from "../application/scheduler/scheduler.ts";
-import type { AudioEvent, AudioStats } from "./delivery/audio-manager.ts";
 import type { DeliveryEvent, DeliveryItem } from "./delivery/delivery-queue.ts";
 import type { DecisionCycleResult } from "./master/decision-plane.ts";
 import type { WorldRevision } from "../domain/decision/types.ts";
@@ -30,7 +29,8 @@ import { DeliveryQueue } from "./delivery/delivery-queue.ts";
 import { DeliveryBatcher, type PendingResult } from "./delivery/delivery-batcher.ts";
 import { DeliveryPolicy } from "./delivery/delivery-policy.ts";
 import { TranscriptCoalescer } from "./workers/transcript-coalescer.ts";
-import { SimulatedAudioManager } from "./delivery/audio-manager.ts";
+import { SimulatedAudioManager, type AudioEvent, type AudioStats, type DeliveredAudioChunk } from "./delivery/audio-manager.ts";
+import type { TtsPort } from "./delivery/tts-port.ts";
 
 export interface TaskView {
   readonly taskId: string;
@@ -56,6 +56,8 @@ export interface AudioView {
   readonly taskId: string | null;
   readonly token: number;
   readonly stoppedToken: number | null;
+  /** simulated = 定时器模拟分片；real = 真实 TTS 合成。 */
+  readonly mode: "simulated" | "real";
   readonly stats: AudioStats;
 }
 
@@ -95,6 +97,11 @@ export interface JarvisRuntimeOptions {
   readonly selected: SelectedModel;
   readonly logger?: Logger;
   readonly maxTimelineEntries?: number;
+  /**
+   * 真实 TTS 端口。提供则播放分片来自真实合成；省略则为模拟分片。
+   * 由组合根（app.ts）根据配置构造，运行时不接触密钥。
+   */
+  readonly tts?: TtsPort;
 }
 
 export const DEFAULT_MAX_TIMELINE_ENTRIES = 200;
@@ -124,6 +131,7 @@ export class JarvisRuntime {
   });
 
   private readonly listeners = new Set<(snapshot: RuntimeSnapshot) => void>();
+  private readonly audioChunkListeners = new Set<(chunk: DeliveredAudioChunk) => void>();
   private readonly unsubscribers: Array<() => void> = [];
   private readonly timeline: TimelineEntry[] = [];
 
@@ -157,7 +165,14 @@ export class JarvisRuntime {
     });
     this.world = new WorldModel({ scheduler: this.scheduler });
 
-    this.audio = new SimulatedAudioManager();
+    this.audio = new SimulatedAudioManager({
+      ...(options.tts === undefined ? {} : { synthesizer: options.tts }),
+      onChunk: (chunk) => {
+        // 真实音频分片推给订阅者（演示服务 → 浏览器播放）。
+        // 注意：这里同样带播放代次，浏览器可据 token 拒绝旧代次的分片。
+        for (const listener of [...this.audioChunkListeners]) listener(chunk);
+      },
+    });
     this.delivery = new DeliveryQueue({ audio: this.audio });
 
     this.plane = new MasterDecisionPlane({
@@ -246,6 +261,7 @@ export class JarvisRuntime {
         taskId: this.audio.currentTaskId,
         token: this.audio.currentToken,
         stoppedToken: this.stoppedToken,
+        mode: this.audio.usesRealSynthesis ? "real" : "simulated",
         stats: this.audio.stats(),
       },
       lastDecision: this.lastDecision,
@@ -279,6 +295,14 @@ export class JarvisRuntime {
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);
+    };
+  }
+
+  /** 订阅真实音频分片（演示服务用它推给浏览器播放）。 */
+  public onAudioChunk(listener: (chunk: DeliveredAudioChunk) => void): () => void {
+    this.audioChunkListeners.add(listener);
+    return () => {
+      this.audioChunkListeners.delete(listener);
     };
   }
 
@@ -489,6 +513,8 @@ function describeAudioEvent(event: AudioEvent): string {
       return `${event.taskId} 播报完成（token #${event.token}）`;
     case "playback_stopped":
       return `${event.taskId} 已停播：${event.reason}（token #${event.token} 作废）`;
+    case "playback_failed":
+      return `${event.taskId} 合成失败：${event.reason}（token #${event.token}）`;
   }
 }
 
