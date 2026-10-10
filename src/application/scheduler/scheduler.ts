@@ -370,7 +370,10 @@ export class TaskScheduler {
         this.touch(task, "task_tool_call", event.at, { toolName: event.toolName });
         return;
       case "worker_succeeded":
-        this.settle(task, "succeeded", "task_succeeded", event.at, { resultSummary: event.summary });
+        this.settle(task, "succeeded", "task_succeeded", event.at, {
+          resultSummary: event.summary,
+          spokenSummary: event.spokenSummary,
+        });
         return;
       case "worker_failed":
         this.settle(task, "failed", "task_failed", event.at, { failureReason: event.reason });

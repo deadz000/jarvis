@@ -204,12 +204,16 @@ function renderTasks(tasks) {
         : task.cancelReason
           ? '<div class="result">取消原因：' + esc(task.cancelReason) + "</div>"
           : "";
+    const spoken = task.spokenSummary
+      ? '<div class="sub" style="margin-top:7px">🔊 播报稿：' + esc(task.spokenSummary) + "</div>"
+      : "";
     return '<div class="card ' + task.state + '">'
       + '<div class="card-head"><span class="card-id">' + esc(task.taskId) + " · gen " + task.runGeneration
       + " · " + esc(task.priority) + '</span><span class="badge ' + task.state + '">' + esc(task.state) + "</span></div>"
       + '<div class="goal">' + esc(task.goal) + "</div>"
       + '<div class="sub">' + timing + "</div>"
       + body
+      + spoken
       + (active ? '<div class="row"><button class="tiny" data-cancel="' + esc(task.taskId) + '">取消这个任务</button></div>' : "")
       + "</div>";
   }).join("");

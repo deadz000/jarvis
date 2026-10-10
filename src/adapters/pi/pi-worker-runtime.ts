@@ -16,6 +16,8 @@
 import { createAgentSession, SessionManager, type ModelRuntime } from "@earendil-works/pi-coding-agent";
 
 import type { WorkerEvent, WorkerHandle, WorkerRuntime, WorkerStartRequest } from "../../application/workers/ports.ts";
+import { buildWorkerPrompt } from "../../application/workers/worker-prompt.ts";
+import { resolveSpokenText } from "../../application/delivery/spoken-text.ts";
 import type { ThinkingLevel } from "../../config/env.ts";
 import type { Logger } from "../../observability/logger.ts";
 import {
@@ -32,6 +34,8 @@ type PiSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
 
 /** 结果摘要进入 Scheduler 前必须截断，避免把无界文本塞进状态与后续上下文。 */
 export const MAX_RESULT_SUMMARY_LENGTH = 2000;
+/** 口语播报稿的上限：约一口气可播完。 */
+export const MAX_SPOKEN_SUMMARY_LENGTH = 180;
 
 export interface PiWorkerRuntimeOptions {
   readonly modelRuntime: ModelRuntime;
@@ -80,8 +84,17 @@ export function buildTerminalEvent(
   const limit = options.maxSummaryLength ?? MAX_RESULT_SUMMARY_LENGTH;
 
   switch (outcome.status) {
-    case "succeeded":
-      return { type: "worker_succeeded", ...base, summary: truncate(outcome.text, limit) };
+    case "succeeded": {
+      // 双受众：完整结果给面板，口语稿给语音播报。
+      // 口语稿优先取模型给的 [[SPOKEN]] 块，缺失时**确定性**兜底（铁律 7）。
+      const spoken = resolveSpokenText(outcome.text, { maxLength: MAX_SPOKEN_SUMMARY_LENGTH });
+      return {
+        type: "worker_succeeded",
+        ...base,
+        summary: truncate(spoken.full, limit),
+        spokenSummary: spoken.spoken,
+      };
+    }
     case "cancelled":
       return { type: "worker_cancelled", ...base, reason: outcome.errorMessage ?? outcome.reason };
     case "unverified":
@@ -201,7 +214,7 @@ export class PiWorkerRuntime implements WorkerRuntime {
 
         if (cancelRequested) requestAbort("Session 就绪时已有待处理的取消请求");
 
-        await created.session.prompt(goal);
+        await created.session.prompt(buildWorkerPrompt(goal));
         if (released) return;
 
         const outcome = classifySessionOutcome(finalAssistant, created.session.getLastAssistantText(), {

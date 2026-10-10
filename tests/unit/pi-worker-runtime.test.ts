@@ -105,4 +105,38 @@ describe("buildTerminalEvent — 终态到 Worker 事件的映射", () => {
       expect(event.at).toBe(BASE.at);
     }
   });
+
+  it("成功结果同时产出「完整结果」与「口语稿」（双受众）", () => {
+    const event = buildTerminalEvent(
+      outcome({
+        status: "succeeded",
+        text: "# 结果\n- **完成**了三项检查\n\n[[SPOKEN]]三项检查都过了，没有发现问题。[[/SPOKEN]]",
+      }),
+      BASE,
+      { cancelRequested: false },
+    );
+
+    expect(event.type).toBe("worker_succeeded");
+    if (event.type !== "worker_succeeded") throw new Error("类型不符");
+    // 完整结果保留结构，供面板展示；标记块被剥离
+    expect(event.summary).toContain("三项检查");
+    expect(event.summary).not.toContain("[[SPOKEN]]");
+    expect(event.summary).not.toContain("[[/SPOKEN]]");
+    // 口语稿单独给出，供 TTS 播报
+    expect(event.spokenSummary).toBe("三项检查都过了，没有发现问题。");
+  });
+
+  it("模型没给口语稿时，用确定性转换兜底（而不是空播报）", () => {
+    const event = buildTerminalEvent(
+      outcome({ status: "succeeded", text: "## 结论\n```bash\nrm -rf build\n```\n构建脚本已更新。" }),
+      BASE,
+      { cancelRequested: false },
+    );
+
+    if (event.type !== "worker_succeeded") throw new Error("类型不符");
+    expect(event.spokenSummary).toBeDefined();
+    expect(event.spokenSummary).not.toContain("rm -rf");
+    expect(event.spokenSummary).not.toContain("#");
+    expect(event.spokenSummary).toContain("构建脚本已更新");
+  });
 });

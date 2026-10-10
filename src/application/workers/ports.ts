@@ -36,7 +36,13 @@ export interface WorkerToolCallEvent extends WorkerEventBase {
 
 export interface WorkerSucceededEvent extends WorkerEventBase {
   readonly type: "worker_succeeded";
+  /** 完整结果（面板与历史记录用）。 */
   readonly summary: string;
+  /**
+   * 口语化播报稿（语音交付用）。可省略 —— 由适配层用**确定性**转换兜底生成，
+   * 见 `application/delivery/spoken-text.ts`。
+   */
+  readonly spokenSummary?: string;
 }
 
 export interface WorkerFailedEvent extends WorkerEventBase {

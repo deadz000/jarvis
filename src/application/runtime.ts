@@ -39,6 +39,8 @@ export interface TaskView {
   readonly terminalAt: number | null;
   readonly lastActivityAt: number;
   readonly resultSummary: string | null;
+  /** 口语化播报稿（TTS 实际念的那一段）。 */
+  readonly spokenSummary: string | null;
   readonly failureReason: string | null;
   readonly cancelReason: string | null;
 }
@@ -237,10 +239,10 @@ export class JarvisRuntime {
         if (event.type === "task_succeeded") {
           const task = this.scheduler.getTask(event.taskId);
           if (task?.resultSummary !== undefined) {
-            // 结果就绪 → 面板立刻可见，交付另行排队。
+            // 结果就绪 → 面板立刻可见（用完整结果），交付另行排队（用口语稿）。
             this.delivery.enqueue({
               taskId: task.taskId,
-              summary: task.resultSummary,
+              summary: task.spokenSummary ?? task.resultSummary,
               priority: task.priority,
             });
           }
@@ -293,6 +295,7 @@ function toTaskView(task: {
   terminalAt?: number;
   lastActivityAt: number;
   resultSummary?: string;
+  spokenSummary?: string;
   failureReason?: string;
   cancelReason?: string;
 }): TaskView {
@@ -307,6 +310,7 @@ function toTaskView(task: {
     terminalAt: task.terminalAt ?? null,
     lastActivityAt: task.lastActivityAt,
     resultSummary: task.resultSummary ?? null,
+    spokenSummary: task.spokenSummary ?? null,
     failureReason: task.failureReason ?? null,
     cancelReason: task.cancelReason ?? null,
   };

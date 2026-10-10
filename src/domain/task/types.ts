@@ -74,6 +74,8 @@ export interface TaskRecord {
   readonly cancelRequestedAt?: number;
   readonly cancelReason?: string;
   readonly resultSummary?: string;
+  /** 口语化播报稿（语音交付用）。与 `resultSummary` 分开，避免两种受众互相妥协。 */
+  readonly spokenSummary?: string;
   readonly failureReason?: string;
 }
 
