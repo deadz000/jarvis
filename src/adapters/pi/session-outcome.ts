@@ -15,12 +15,24 @@
  * 「没有把已发出请求误报为成功」。
  */
 
-export type SessionOutcomeStatus = "succeeded" | "failed" | "unverified";
+export type SessionOutcomeStatus = "succeeded" | "failed" | "cancelled" | "unverified";
 
 /** 从 SDK 消息中按需取出的最小字段集合，避免依赖未冻结的消息类型。 */
 export interface AssistantFinalMessage {
   readonly stopReason: string | undefined;
   readonly errorMessage: string | undefined;
+}
+
+export interface ClassifySessionOutcomeOptions {
+  /**
+   * 适配器是否已向执行层发出取消请求。
+   *
+   * 实机结论（ADR-001 §3.2.2）：`abort()` 之后 assistant 终态的 stopReason 同样是
+   * `"error"`，与真实的 provider 错误**无法仅凭 stopReason 区分**。
+   * 因此必须由「是谁发起了取消」来判定 —— 这正是踩坑指南铁律 3
+   * 「『是谁』与『哪一次』必须分离」的又一体现。
+   */
+  readonly cancelRequested?: boolean;
 }
 
 export interface SessionOutcome {
@@ -56,6 +68,7 @@ export function readAssistantFinalMessage(message: unknown): AssistantFinalMessa
 export function classifySessionOutcome(
   finalMessage: AssistantFinalMessage | undefined,
   lastAssistantText: string | undefined,
+  options: ClassifySessionOutcomeOptions = {},
 ): SessionOutcome {
   const text = lastAssistantText ?? "";
 
@@ -72,6 +85,16 @@ export function classifySessionOutcome(
   const { stopReason, errorMessage } = finalMessage;
 
   if (stopReason !== undefined && FAILURE_STOP_REASONS.has(stopReason)) {
+    // 被取消与真实失败在 SDK 层都表现为 error，必须靠「谁发起了取消」区分。
+    if (options.cancelRequested === true) {
+      return {
+        status: "cancelled",
+        stopReason,
+        errorMessage,
+        text,
+        reason: `已请求取消，assistant 终态 stopReason=${stopReason} → 判定为已取消而非失败`,
+      };
+    }
     return {
       status: "failed",
       stopReason,
@@ -91,6 +114,8 @@ export function classifySessionOutcome(
     };
   }
 
+  // 注意：即使请求过取消，只要最终真的产出了正文并正常收尾，就是成功
+  // （对应 Scheduler 里「取消与完成竞态」的处理）。
   return {
     status: "succeeded",
     stopReason,

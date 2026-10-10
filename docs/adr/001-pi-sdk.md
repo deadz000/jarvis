@@ -102,6 +102,31 @@ agent_start → turn_start → message_start/message_end ×3 → turn_end → ag
 > 说明：`aborted` 也属于「未成功」，但在 Scheduler 层应映射为「已取消」而不是「失败」，
 > 因此 `classifySessionOutcome` 保留原始 `stopReason` 供上层细分。
 
+### 3.2.2 实机验证：`abort()` 的行为（M1 核心验收项）
+
+`npm run example:abort`（`examples/sdk/02-abort-and-tools.ts`）用一个无副作用的自定义工具
+`slow_probe`（在 `execute` 内等待并监听 `signal`）实测了三个阶段：
+
+| 阶段 | 实测结果 |
+|---|---|
+| A. 自定义工具闭环 | 模型调用工具 → 参数 `{ms:2000}` 正确送达 → 工具 2004ms 返回 → 模型继续并给出最终答复；终态 `stopReason: "stop"` |
+| B. 取消传递 | 工具启动后 1200ms 调用 `session.abort()`，`abort()` **仅耗时 2ms**；工具在 **1231ms** 处收到 `AbortSignal` |
+| C. `steer()` 契约 | 流式期间追加输入返回 `"queued"` |
+
+**结论（FR-07 核心要求成立）**：取消**确实能传递到自定义工具执行层** ——
+`ToolDefinition.execute` 的第三个参数就是 `AbortSignal`，工具实现可以据此提前退出。
+
+但同时暴露一个必须处理的陷阱：
+
+- `abort()` 之后 `session.prompt()` **仍然是 resolve，不是 reject**；
+- assistant 终态的 `stopReason` 仍是 **`"error"`**，`errorMessage` 为 `"This operation was aborted"`；
+- 也就是说，**「被取消」与「真实的 provider 失败」在 SDK 层同形**，仅凭 `stopReason` 无法区分。
+
+因此适配层必须引入「是谁发起了取消」这一维度：`classifySessionOutcome` 新增
+`cancelRequested` 选项 —— 已请求取消时 `error` 判定为 `cancelled`，否则判定为 `failed`；
+而若最终仍正常产出正文并正常收尾，则判定为 `succeeded`（取消输给了完成）。
+这直接对应 Scheduler 的取消竞态处理（见 ADR-002 §2.4）。
+
 ### 3.3 凭据与配置来源
 
 - provider 凭据来自进程环境变量（Pi `docs/providers.md`）：
@@ -132,7 +157,7 @@ agent_start → turn_start → message_start/message_end ×3 → turn_end → ag
 |---|---|
 | 版本迭代快 | 0.74.x → 1.1.0 之间子路径导出已变更（`./hooks` 在 1.1.0 中**不存在**）。升级必须重跑 M1 PoC 并修订本 ADR |
 | 子路径导出不完整 | `./client` 与 `./experimental/plugin` 只声明了 `source` 条件（指向 TS 源码），**不适合作为已发布包的外部入口**；本项目只用主入口 `.` |
-| SDK 行为尚未真实调用验证 | 本机无模型凭据，`npm run example:sdk` **未取得真实模型响应**；`abort` 能否中止自定义长任务工具、取消确认的时点**均未验证**（SRS FR-07 验收项，M1 必做） |
+| SDK 行为已部分实测 | 真实模型调用、自定义工具闭环与 `abort` 传递均已实测（见 §3.2.2）；但**多轮工具循环中的取消确认时点、超时清理、会话持久化差异仍待 M1 补齐** |
 | 自定义工具路径 | 自定义工具走 extensions 注册，M1 需确认其对 `abort` 的响应方式（能否收到取消信号） |
 | 无浏览器条件导出 | exports 无 `browser` 条件，UI 层不能直接复用 SDK，需经服务端接口 |
 | 内置扩展未自动加载 | SDK Session **不会**加载 CLI 的 `codemode` / `tool_search` / MCP，需要时须显式加入 `DefaultResourceLoader.extensionFactories` |
@@ -151,8 +176,9 @@ agent_start → turn_start → message_start/message_end ×3 → turn_end → ag
 | `npm run check`（配置与凭据检测链路） | ✅ 输出 `app.check.completed`，`modelCallsPossible: false` |
 | 失败路径终态判定（无效凭据回归） | ✅ 正确报告 `status: failed` / `stopReason: error` / 401 `errorMessage`，exit 1（**修复前误报成功，exit 0**） |
 | 凭据缺失路径 | ✅ 输出可读的 `[example-error]` 提示，exit 1，无裸栈 |
-| 真实模型调用 | ⛔ **未验证** —— 网络链路已通（无效 Key 收到 provider 401，证明请求已到达 `api.deepseek.com`），但尚未取得有效模型响应；待注入有效凭据后执行 `npm run example:sdk` |
-| `abort` / 自定义工具取消 | ⛔ **未验证** —— M1 范围 |
+| 真实模型调用（`cf-fan/deepseek-flash`） | ✅ 8956ms 完成，17 个 text_delta，`stopReason: "stop"`，exit 0 |
+| 自定义工具闭环 + 取消传递（M1） | ✅ 工具收到 `AbortSignal` 并在 abort 后 1231ms 退出；`abort()` 耗时 2ms；`steer()` 返回 `"queued"` |
+| 多轮工具循环的取消确认时点 / 超时清理 / 会话持久化 | ⛔ **未验证** —— M1 剩余项 |
 
 ---
 
@@ -161,7 +187,7 @@ agent_start → turn_start → message_start/message_end ×3 → turn_end → ag
 出现以下任一情况必须重开本 ADR：
 
 1. SDK 发布 major 版本，或 `1.1.0` 出现影响本项目的安全/行为修复；
-2. M1 证明 `abort()` **无法**中止自定义长任务工具，导致 FR-07 验收不可达；
+2. M1 后续实验发现 `abort()` 在**某些工具类型**上无法传递（自定义工具已验证可收到信号，见 §3.2.2）；
 3. 需要直接依赖 `@earendil-works/pi-agent-core` 等更低层包（届时需重新评估边界划分）；
 4. 许可证变更，或需要浏览器端复用 SDK；
 5. `engines` 要求超出目标运行环境。

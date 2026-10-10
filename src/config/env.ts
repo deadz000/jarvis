@@ -2,10 +2,12 @@
  * 运行配置：只从进程环境读取，负责校验与归一化。
  *
  * 硬性约束（实施计划 M0 出口条件）：凭据值绝不进入返回值、日志和错误信息，
- * 配置层只保留「是否检测到某 provider 的凭据」这一布尔事实。
+ * 配置层只保留「是否检测到某 provider 的凭据」这一事实。
  *
  * 依据：项目需求规格说明书 §7.1/§7.6、开发实施计划 M0「配置加载」。
  */
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 
 /** 日志等级，与 observability/logger 共用。 */
 export const LOG_LEVELS = ["debug", "info", "warn", "error"] as const;
@@ -31,10 +33,25 @@ export const PROVIDER_CREDENTIALS: ReadonlyArray<{ provider: string; envVar: str
   { provider: "moonshot", envVar: "MOONSHOT_API_KEY" },
 ];
 
+/**
+ * 自定义 OpenAI 兼容端点的凭据变量。
+ * 它不被 Pi 直接识别，而是通过 config/models.json 里的 `apiKey: "$JARVIS_MODEL_API_KEY"`
+ * 插值后使用（见 Pi docs/models.md「Configure a compatible endpoint」）。
+ */
+export const CUSTOM_ENDPOINT_KEY_ENV_VAR = "JARVIS_MODEL_API_KEY";
+
+/** 自定义端点声明文件的默认位置（相对 workspace）。 */
+export const DEFAULT_MODELS_RELATIVE_PATH = join("config", "models.json");
+
+/** 并发上限默认值：仅作为可配置项的初值，不是性能结论。 */
+export const DEFAULT_MAX_CONCURRENT_TASKS = 4;
+
 export interface CredentialStatus {
   /** 检测到凭据的 provider 名（不含任何密钥内容）。 */
   readonly detectedProviders: readonly string[];
-  /** 至少检测到一个 provider 凭据。 */
+  /** 检测到凭据的环境变量名（同样不含值）。 */
+  readonly detectedEnvVars: readonly string[];
+  /** 至少检测到一个可用于模型调用的凭据。 */
   readonly hasAny: boolean;
 }
 
@@ -45,6 +62,10 @@ export interface AppConfig {
   readonly modelProvider: string | undefined;
   readonly modelId: string | undefined;
   readonly thinkingLevel: ThinkingLevel | undefined;
+  /** 自定义端点声明文件（models.json）路径；不存在时为 undefined。 */
+  readonly modelsPath: string | undefined;
+  /** 并发执行上限。配置化，不沿用旧项目的硬编码值。 */
+  readonly maxConcurrentTasks: number;
   readonly credentials: CredentialStatus;
 }
 
@@ -62,31 +83,61 @@ function readOptional(env: NodeJS.ProcessEnv, name: string): string | undefined 
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function parseLogLevel(env: NodeJS.ProcessEnv): LogLevel {
-  const raw = readOptional(env, "JARVIS_LOG_LEVEL");
-  if (raw === undefined) return "info";
-  const found = LOG_LEVELS.find((level) => level === raw);
+function parseEnum<T extends string>(
+  raw: string,
+  allowed: readonly T[],
+  envName: string,
+): T {
+  const found = allowed.find((candidate) => candidate === raw);
   if (found === undefined) {
-    throw new ConfigError(`JARVIS_LOG_LEVEL 非法：${raw}（可选：${LOG_LEVELS.join(" / ")}）`);
+    throw new ConfigError(`${envName} 非法：${raw}（可选：${allowed.join(" / ")}）`);
   }
   return found;
+}
+
+function parseLogLevel(env: NodeJS.ProcessEnv): LogLevel {
+  const raw = readOptional(env, "JARVIS_LOG_LEVEL");
+  return raw === undefined ? "info" : parseEnum(raw, LOG_LEVELS, "JARVIS_LOG_LEVEL");
 }
 
 function parseThinkingLevel(env: NodeJS.ProcessEnv): ThinkingLevel | undefined {
   const raw = readOptional(env, "JARVIS_THINKING_LEVEL");
-  if (raw === undefined) return undefined;
-  const found = THINKING_LEVELS.find((level) => level === raw);
-  if (found === undefined) {
-    throw new ConfigError(`JARVIS_THINKING_LEVEL 非法：${raw}（可选：${THINKING_LEVELS.join(" / ")}）`);
-  }
-  return found;
+  return raw === undefined ? undefined : parseEnum(raw, THINKING_LEVELS, "JARVIS_THINKING_LEVEL");
 }
 
-function detectCredentials(env: NodeJS.ProcessEnv): CredentialStatus {
-  const detectedProviders = PROVIDER_CREDENTIALS.filter(
-    (entry) => readOptional(env, entry.envVar) !== undefined,
-  ).map((entry) => entry.provider);
-  return { detectedProviders, hasAny: detectedProviders.length > 0 };
+function parseMaxConcurrentTasks(env: NodeJS.ProcessEnv): number {
+  const raw = readOptional(env, "JARVIS_MAX_CONCURRENT_TASKS");
+  if (raw === undefined) return DEFAULT_MAX_CONCURRENT_TASKS;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new ConfigError(`JARVIS_MAX_CONCURRENT_TASKS 必须是 >= 1 的整数，收到：${raw}`);
+  }
+  return parsed;
+}
+
+function parseModelsPath(env: NodeJS.ProcessEnv, workspace: string): string | undefined {
+  const configured = readOptional(env, "JARVIS_MODELS_PATH");
+  if (configured !== undefined) return configured;
+  const fallback = join(workspace, DEFAULT_MODELS_RELATIVE_PATH);
+  return existsSync(fallback) ? fallback : undefined;
+}
+
+function detectCredentials(env: NodeJS.ProcessEnv, modelProvider: string | undefined): CredentialStatus {
+  const detectedProviders: string[] = [];
+  const detectedEnvVars: string[] = [];
+
+  for (const entry of PROVIDER_CREDENTIALS) {
+    if (readOptional(env, entry.envVar) === undefined) continue;
+    detectedProviders.push(entry.provider);
+    detectedEnvVars.push(entry.envVar);
+  }
+
+  if (readOptional(env, CUSTOM_ENDPOINT_KEY_ENV_VAR) !== undefined) {
+    detectedProviders.push(modelProvider ?? "custom-endpoint");
+    detectedEnvVars.push(CUSTOM_ENDPOINT_KEY_ENV_VAR);
+  }
+
+  return { detectedProviders, detectedEnvVars, hasAny: detectedProviders.length > 0 };
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -104,7 +155,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     modelProvider,
     modelId,
     thinkingLevel: parseThinkingLevel(env),
-    credentials: detectCredentials(env),
+    modelsPath: parseModelsPath(env, workspace),
+    maxConcurrentTasks: parseMaxConcurrentTasks(env),
+    credentials: detectCredentials(env, modelProvider),
   };
 }
 
@@ -121,10 +174,10 @@ export function describeConfig(config: AppConfig): Record<string, unknown> {
     modelProvider: config.modelProvider ?? null,
     modelId: config.modelId ?? null,
     thinkingLevel: config.thinkingLevel ?? null,
+    modelsPath: config.modelsPath ?? null,
+    maxConcurrentTasks: config.maxConcurrentTasks,
     detectedProviders: config.credentials.detectedProviders,
-    detectedEnvVars: PROVIDER_CREDENTIALS.filter((entry) =>
-      config.credentials.detectedProviders.includes(entry.provider),
-    ).map((entry) => entry.envVar),
+    detectedEnvVars: config.credentials.detectedEnvVars,
   };
 }
 
@@ -133,7 +186,9 @@ export function describeConfig(config: AppConfig): Record<string, unknown> {
  */
 export function assertModelCredentials(config: AppConfig): void {
   if (config.credentials.hasAny) return;
-  const expected = PROVIDER_CREDENTIALS.map((entry) => entry.envVar).join(" 或 ");
+  const expected = [...PROVIDER_CREDENTIALS.map((entry) => entry.envVar), CUSTOM_ENDPOINT_KEY_ENV_VAR].join(
+    " 或 ",
+  );
   throw new ConfigError(
     `未检测到任何模型凭据。请复制 .env.example 为 .env 并设置 ${expected}（.env 不会被提交）。`,
   );

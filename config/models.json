@@ -1,0 +1,15 @@
+{
+  "$comment": "自定义 OpenAI 兼容端点声明。本文件只含端点与模型元数据，不含任何密钥；apiKey 通过 $JARVIS_MODEL_API_KEY 从进程环境插值（密钥在 gitignored 的 .env 中）。见 docs/adr/001-pi-sdk.md。",
+  "providers": {
+    "cf-fan": {
+      "baseUrl": "https://cf.api.fan/v1",
+      "api": "openai-responses",
+      "apiKey": "$JARVIS_MODEL_API_KEY",
+      "models": [
+        {
+          "id": "deepseek-flash"
+        }
+      ]
+    }
+  }
+}

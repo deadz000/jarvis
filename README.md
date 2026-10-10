@@ -12,14 +12,15 @@
 
 | 里程碑 | 状态 | 说明 |
 |---|---|---|
-| **M0 项目初始化与 SDK 核验** | 🟡 基本完成 | 工程骨架、锁定依赖、配置/日志、ADR-001、最小 Session 示例均已就绪；**真实模型调用待注入凭据后验证** |
-| M1 单 Agent Runtime PoC | ⬜ 未开始 | 事件生命周期、`abort`、自定义工具取消语义 |
-| M2 Worker Runtime Adapter | ⬜ 未开始 | 端口定义、独立 Session、`taskId`/`runGeneration` 关联 |
-| M3 确定性 Scheduler | ⬜ 未开始 | 状态机、并发准入、取消竞态、迟到事件过滤 |
+| **M0 项目初始化与 SDK 核验** | ✅ 完成 | 工程骨架、锁定依赖、配置/日志、ADR-001、最小 Session 示例；真实模型调用已实测通过 |
+| **M1 单 Agent Runtime PoC** | 🟡 核心已验证 | 已实测：事件生命周期、自定义工具闭环、`abort` 传递到工具层、`steer` 契约。**未验证**：多轮工具循环的取消确认时点、超时清理、会话持久化差异 |
+| **M2 Worker Runtime Adapter** | 🟡 端口已定 | `WorkerRuntime` 端口 + `FakeWorkerRuntime`（确定性、显式驱动）；事件携带 `taskId`/`runGeneration`。**真实 Pi 适配器未实现** |
+| **M3 确定性 Scheduler** | 🟡 核心已实现 | 状态机 + 单写入口 + 代次隔离 + 取消竞态 + 并发准入 + 幂等键；24 项状态测试**不调用 LLM**。**未实现**：取消超时看门狗、优先级/饥饿防护 |
 | M4–M8 | ⬜ 未开始 | Master 决策面、结果交付、混合输入、持久化恢复、评测 |
 
-**明确未实现（不要当成已具备）**：常驻事件接入、Master 决策、Scheduler、Worker、
-语音/屏幕输入、结果交付、音频仲裁、持久化与恢复。`npm start` 会在日志中显式报告该范围。
+**明确未实现（不要当成已具备）**：常驻事件接入、Master 决策、结果交付、音频仲裁、
+真实 Pi Worker 适配器、持久化与恢复。Scheduler 的**取消超时看门狗、优先级与饥饿防护**同样未实现。
+`npm start` 会在日志中显式报告该范围。
 
 ### M0 实测发现（详见 ADR-001）
 
@@ -79,6 +80,7 @@ npm run example:sdk -- "用一句话介绍这个仓库"
 | `npm test` | vitest 单元测试 |
 | `npm run typecheck` | `tsc --noEmit` 全量类型检查 |
 | `npm run example:sdk -- "<问题>"` | 最小 Session 示例：创建 → 订阅流式事件 → 单轮 prompt → 释放 |
+| `npm run example:abort` | M1 实测：自定义工具闭环 + `abort` 是否传递到工具执行层 + `steer` 契约 |
 | `npm start` | 服务入口（M0 仅输出启动日志与未实现范围） |
 
 ---
@@ -87,17 +89,30 @@ npm run example:sdk -- "用一句话介绍这个仓库"
 
 ```text
 src/
-  app.ts                     # 服务入口（配置校验 + 启动日志 + 退出钩子）
-  config/env.ts              # 环境变量读取、校验与脱敏快照
-  observability/logger.ts    # 结构化 JSON 日志 + 深度脱敏
-examples/sdk/01-minimal.ts   # M0 交付物：最小 AgentSession 示例
-tests/unit/                  # 配置与日志的单元测试
+  app.ts                          # 服务入口（配置校验 + 启动日志 + 退出钩子）
+  config/env.ts                   # 环境变量读取、校验与脱敏快照
+  observability/logger.ts         # 结构化 JSON 日志 + 深度脱敏
+  domain/task/
+    types.ts                      # TaskId / runGeneration / Task 状态与快照
+    state-machine.ts              # 合法转移表（数据声明，可穷举测试）
+  application/
+    scheduler/scheduler.ts        # 确定性 Scheduler：唯一写入口、准入、取消、代次
+    workers/ports.ts              # WorkerRuntime 端口（含取消与事件契约）
+  adapters/
+    pi/session-outcome.ts         # Pi 终态判定（含 abort/取消的特殊性）
+    workers/fake-worker.ts        # 确定性 FakeWorkerRuntime
+examples/sdk/
+  01-minimal.ts                   # 最小 Session 示例
+  02-abort-and-tools.ts           # M1 实测：自定义工具 + 取消传递
+config/models.json                # 自定义端点声明（不含密钥）
+tests/unit/                       # 状态机、Scheduler、配置、日志、终态判定
 docs/
   项目文档索引_v0.1.md
-  项目需求规格说明书_v0.1.md   # 需求主文档
-  开发实施计划_v0.1.md         # 开发顺序与里程碑主文档
-  踩坑指南-问题与解决方案.md    # 旧项目经验（新系统设计检查项）
-  adr/001-pi-sdk.md          # SDK 来源/版本/许可证与已知限制
+  项目需求规格说明书_v0.1.md       # 需求主文档
+  开发实施计划_v0.1.md             # 开发顺序与里程碑主文档
+  踩坑指南-问题与解决方案.md        # 旧项目经验（新系统设计检查项）
+  adr/001-pi-sdk.md               # SDK 来源/版本/许可证与已知限制
+  adr/002-task-lifecycle-and-cancel.md  # Task / runGeneration / 取消语义
 ```
 
 后续里程碑按《开发实施计划》§5 的建议逐步引入 `domain/`、`application/`、`adapters/`。

@@ -73,4 +73,33 @@ describe("classifySessionOutcome", () => {
     expect(outcome.status).toBe("succeeded");
     expect(outcome.stopReason).toBe("length");
   });
+
+  it("已请求取消时 error 判定为 cancelled 而非 failed（实机：abort 后 stopReason 也是 error）", () => {
+    const outcome = classifySessionOutcome(
+      { stopReason: "error", errorMessage: "aborted by user" },
+      undefined,
+      { cancelRequested: true },
+    );
+
+    expect(outcome.status).toBe("cancelled");
+    expect(outcome.stopReason).toBe("error");
+    expect(outcome.reason).toContain("已取消");
+  });
+
+  it("未请求取消时的 error 仍判定为 failed", () => {
+    const outcome = classifySessionOutcome({ stopReason: "error", errorMessage: "401" }, undefined);
+
+    expect(outcome.status).toBe("failed");
+  });
+
+  it("请求过取消但最终成功产出正文，仍判定为 succeeded（取消与完成竞态）", () => {
+    const outcome = classifySessionOutcome(
+      { stopReason: "stop", errorMessage: undefined },
+      "任务实际完成了",
+      { cancelRequested: true },
+    );
+
+    expect(outcome.status).toBe("succeeded");
+    expect(outcome.text).toBe("任务实际完成了");
+  });
 });

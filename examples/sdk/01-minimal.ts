@@ -31,7 +31,9 @@ async function run(): Promise<void> {
 
   assertModelCredentials(config);
 
-  const modelRuntime = await ModelRuntime.create();
+  const modelRuntime = await ModelRuntime.create(
+    config.modelsPath === undefined ? {} : { modelsPath: config.modelsPath },
+  );
   const available = await modelRuntime.getAvailable();
   const availableLabel = available.map((model) => `${model.provider}/${model.id}`).join(", ") || "（无）";
 
