@@ -177,6 +177,32 @@ export class DemoServer {
         return;
       }
 
+      if (request.method === "GET" && path === "/api/history") {
+        const url = new URL(request.url ?? "/", "http://localhost");
+        const rawLimit = Number(url.searchParams.get("limit") ?? "20");
+        const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 200) : 20;
+        sendJson(response, 200, { ok: true, tasks: this.options.runtime.history(limit) });
+        return;
+      }
+
+      if (request.method === "GET" && path === "/api/recovery") {
+        const snapshot = this.options.runtime.snapshot();
+        sendJson(response, 200, { ok: true, ...snapshot.recovery });
+        return;
+      }
+
+      if (request.method === "POST" && path === "/api/recovery/replay") {
+        const body = await readJsonBody(request);
+        const taskId = typeof body["taskId"] === "string" ? body["taskId"] : undefined;
+        if (taskId === undefined) {
+          sendJson(response, 400, { ok: false, reason: "缺少 taskId" });
+          return;
+        }
+        const result = this.options.runtime.replayInterruptedTask(taskId);
+        sendJson(response, result.status === "replayed" ? 200 : 409, { ok: result.status === "replayed", ...result });
+        return;
+      }
+
       if (request.method === "POST" && path === "/api/screen") {
         const body = await readJsonBody(request);
         const enabled = body["enabled"] === true;

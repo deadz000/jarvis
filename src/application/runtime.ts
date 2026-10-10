@@ -30,6 +30,7 @@ import { DeliveryBatcher, type PendingResult } from "./delivery/delivery-batcher
 import { DeliveryPolicy } from "./delivery/delivery-policy.ts";
 import { TranscriptCoalescer } from "./workers/transcript-coalescer.ts";
 import { SpeechActivityTracker } from "./interaction/speech-activity.ts";
+import type { PersistedTask, PersistencePort } from "./storage/store-port.ts";
 import { evaluateScreenIntent } from "./screen/screen-intent-gate.ts";
 import { ScreenMemory } from "./screen/screen-memory.ts";
 import { ScreenObserver, type ScreenObserverEvent } from "./screen/screen-observer.ts";
@@ -129,6 +130,14 @@ export interface RuntimeSnapshot {
     /** 最近一次意图门控的判断结果（让"零成本"这条主张可观测）。 */
     readonly lastGateDecision: string | null;
   };
+  /** 重启恢复状态（M7）。 */
+  readonly recovery: {
+    readonly available: boolean;
+    /** 启动时被标记为「结果未知」的任务数。 */
+    readonly markedUnknown: number;
+    /** 待核对的未终结任务（**不会自动重跑**）。 */
+    readonly pending: readonly { readonly taskId: string; readonly goal: string; readonly state: string }[];
+  };
 }
 
 export interface JarvisRuntimeOptions {
@@ -149,6 +158,10 @@ export interface JarvisRuntimeOptions {
    * 屏幕观察端口组。提供则屏幕观察可用（默认仍关闭，需显式开启）。
    */
   readonly screen?: ScreenWiringOptions;
+  /**
+   * 持久化端口（M7）。提供则任务/结果/决策轨迹落库，并在启动时做恢复核对。
+   */
+  readonly store?: PersistencePort;
 }
 
 /** 屏幕观察的端口组（由组合根构造，运行时负责编排与状态）。 */
@@ -193,6 +206,9 @@ export class JarvisRuntime {
     },
   });
   private readonly asr: AsrPort | undefined;
+  private readonly store: PersistencePort | undefined;
+  private recoveryMarked = 0;
+  private recoveryPending: Array<{ taskId: string; goal: string; state: string }> = [];
   private readonly screenMemory = new ScreenMemory();
   private readonly screenObserver: ScreenObserver | undefined;
   private screenEnabled = false;
@@ -233,6 +249,15 @@ export class JarvisRuntime {
   public constructor(options: JarvisRuntimeOptions) {
     this.config = options.config;
     this.selected = options.selected;
+    this.store = options.store;
+
+    /**
+     * 重启后 taskId 序号必须从持久化的最大值继续，**否则新任务会复用旧 taskId
+     * 并覆盖历史结果** —— 这是实际发生过的缺陷（M7 落库后跑重启流程才暴露）。
+     * 因此它必须在创建 Scheduler **之前**算出来。
+     */
+    const seedOrdinal =
+      this.store === undefined ? undefined : maxTaskOrdinal(this.store.listTasks({ limit: 5_000 }));
     this.logger = options.logger;
     this.maxTimelineEntries = options.maxTimelineEntries ?? DEFAULT_MAX_TIMELINE_ENTRIES;
 
@@ -249,6 +274,7 @@ export class JarvisRuntime {
     this.scheduler = new TaskScheduler({
       runtime: workerRuntime,
       maxConcurrent: options.config.maxConcurrentTasks,
+      ...(seedOrdinal === undefined ? {} : { initialTaskOrdinal: seedOrdinal + 1 }),
       ...(options.logger === undefined ? {} : { logger: options.logger }),
     });
     this.world = new WorldModel({ scheduler: this.scheduler });
@@ -263,6 +289,34 @@ export class JarvisRuntime {
     });
 
     this.asr = options.asr;
+
+    /**
+     * 启动恢复：把上次未终结的任务标为「结果未知」。
+     *
+     * **只标记，不重跑** —— 计划明确要求：不得假设进程重启前的工具已停止，
+     * 也不得盲目重跑可能有副作用的操作。真正重新执行必须由用户显式发起。
+     */
+    if (this.store !== undefined) {
+      this.recoveryMarked = this.store.markInterruptedAsUnknown(
+        Date.now(),
+        "进程重启时该任务未终结：工具是否已停止未知，真实结果未知，需人工核对后再决定是否重跑",
+      );
+      this.recoveryPending = this.store.findNonTerminalTasks().map((item) => ({
+        taskId: item.taskId,
+        goal: item.goal,
+        state: item.state,
+      }));
+      if (this.recoveryMarked > 0) {
+        this.logger?.warn("runtime.recovery_unknown_tasks", {
+          count: this.recoveryMarked,
+          note: "已标记为结果未知，未自动重跑",
+        });
+        this.pushTimeline(
+          "recovery",
+          `重启恢复：${String(this.recoveryMarked)} 个任务上次未终结，已标记为「结果未知」等待核对（**未自动重跑**）`,
+        );
+      }
+    }
 
     this.screenObserver =
       options.screen === undefined
@@ -346,6 +400,7 @@ export class JarvisRuntime {
     this.lastDecision = toDecisionView(result);
     this.dialogue.appendSystem(`调度决策：${describeDecision(this.lastDecision)}`);
     this.pushTimeline("decision", describeDecision(this.lastDecision));
+    this.persistDecision(result, "intent");
     this.emitUpdate();
     return this.lastDecision;
   }
@@ -372,6 +427,66 @@ export class JarvisRuntime {
     return this.screenObserver !== undefined;
   }
 
+  /** 当前快照（供 HTTP 层查询恢复状态）。 */
+  public get storeAvailable(): boolean {
+    return this.store !== undefined;
+  }
+
+  /** 历史任务查询（M7 退出条件：历史任务和结果可以正确查询）。 */
+  public history(limit = 20): readonly PersistedTask[] {
+    return this.store?.listTasks({ limit }) ?? [];
+  }
+
+  /**
+   * **显式**重跑一个「结果未知」的任务。
+   *
+   * 这是本系统唯一的重跑入口，且必须满足三个条件：
+   * 1. 该任务确实被标记为「结果未知」（不能重跑有确定结果的）；
+   * 2. 尚未重跑过（防止重复提交产生重复副作用）；
+   * 3. 由调用方显式发起（不存在任何自动重跑路径）。
+   *
+   * 重跑会创建一个**新的 taskId**，而不是把老任务改回 running —— 老任务的
+   * 「结果未知」这一事实不可被抹掉，两者的关联记在 `replay_task_id` 里。
+   */
+  public replayInterruptedTask(
+    taskId: string,
+  ): { status: "replayed"; newTaskId: string } | { status: "rejected"; reason: string } {
+    const store = this.store;
+    if (store === undefined) return { status: "rejected", reason: "未配置持久化" };
+
+    const record = store.getTask(taskId);
+    if (record === undefined) return { status: "rejected", reason: `找不到任务 ${taskId}` };
+    if (record.recoveryStatus === null) {
+      return { status: "rejected", reason: `任务 ${taskId} 没有"结果未知"标记（state=${record.state}），无需重跑` };
+    }
+    if (record.replayedAt !== null) {
+      return {
+        status: "rejected",
+        reason: `任务 ${taskId} 已于 ${new Date(record.replayedAt).toISOString()} 重跑过（新任务 ${String(record.replayTaskId)}）`,
+      };
+    }
+
+    const outcome = this.scheduler.createTask({
+      goal: record.goal,
+      idempotencyKey: `replay:${taskId}`,
+      decisionId: `replay-${taskId}`,
+      priority: record.priority as Priority,
+    });
+    if (outcome.status === "rejected") {
+      return { status: "rejected", reason: `创建重跑任务被拒绝：${outcome.reason}` };
+    }
+
+    store.markReplayed(taskId, outcome.task.taskId, Date.now());
+    this.recoveryPending = this.recoveryPending.filter((item) => item.taskId !== taskId);
+    this.pushTimeline(
+      "recovery_replay",
+      `显式重跑 ${taskId} → 新任务 ${outcome.task.taskId}（老任务的「结果未知」标记保留）`,
+    );
+    this.emitUpdate();
+
+    return { status: "replayed", newTaskId: outcome.task.taskId };
+  }
+
   private onScreenEvent(event: ScreenObserverEvent): void {
     switch (event.type) {
       case "screen_started":
@@ -396,6 +511,8 @@ export class JarvisRuntime {
           "screen_summary",
           `${event.fromModel ? "模型" : "确定性兜底"}摘要：${event.text}`,
         );
+        // 语义记忆：带可追溯来源（SRS 要求记忆不能是无来源的断言）
+        this.persistMemory("screen", event.text, "screen:observer");
         break;
       case "screen_error":
         this.logger?.warn("runtime.screen_error", { error: event.error });
@@ -473,7 +590,93 @@ export class JarvisRuntime {
         lastSummary: this.lastScreenSummary,
         lastGateDecision: this.lastScreenGateDecision,
       },
+      recovery: {
+        available: this.store !== undefined,
+        markedUnknown: this.recoveryMarked,
+        pending: this.recoveryPending,
+      },
     };
+  }
+
+  /**
+   * 持久化一次调度事件。
+   *
+   * 注意一个已知限制：`TaskRecord` **不携带 `decisionId` / `idempotencyKey`**，
+   * 所以这两列落库为 NULL —— 意味着**跨重启的幂等去重无法恢复**
+   * （重启后同一个 decision 再次被提交，可能创建重复任务）。
+   * 这需要把幂等键提升到 TaskRecord 才能解决，已作为限制记录，不静默忽略。
+   */
+  private persistEvent(event: SchedulerEvent): void {
+    const store = this.store;
+    if (store === undefined) return;
+
+    const task = this.scheduler.getTask(event.taskId);
+    if (task !== undefined) {
+      // 保留已有的恢复维度：新事件不应抹掉"结果未知"这个标记
+      const existing = store.getTask(task.taskId);
+      store.saveTask({
+        taskId: task.taskId,
+        goal: task.goal,
+        state: task.state,
+        runGeneration: task.runGeneration,
+        priority: task.priority,
+        createdAt: task.createdAt,
+        startedAt: task.startedAt ?? null,
+        terminalAt: task.terminalAt ?? null,
+        lastActivityAt: task.lastActivityAt,
+        resultSummary: task.resultSummary ?? null,
+        spokenSummary: task.spokenSummary ?? null,
+        failureReason: task.failureReason ?? null,
+        cancelReason: task.cancelReason ?? null,
+        decisionId: null,
+        idempotencyKey: null,
+        recoveryStatus: existing?.recoveryStatus ?? null,
+        recoveredAt: existing?.recoveredAt ?? null,
+        recoveryNote: existing?.recoveryNote ?? null,
+        replayedAt: existing?.replayedAt ?? null,
+        replayTaskId: existing?.replayTaskId ?? null,
+      });
+    }
+
+    store.appendTaskEvent({
+      taskId: event.taskId,
+      type: event.type,
+      state: task?.state ?? null,
+      at: Date.now(),
+      runGeneration: task?.runGeneration ?? null,
+      detail: describeSchedulerEvent(event),
+    });
+  }
+
+  private persistDecision(result: DecisionCycleResult, mode: "intent" | "delivery"): void {
+    const store = this.store;
+    if (store === undefined || result.decisionId === null) return;
+
+    store.saveDecision({
+      decisionId: result.decisionId,
+      mode,
+      status: result.status,
+      at: Date.now(),
+      elapsedMs: result.elapsedMs,
+      applied: result.applied.map((action) => `${action.type} ${action.detail}`),
+      rejected: result.rejected.map(
+        (action) => `${action.action.type} 被拒(${action.reason}) ${JSON.stringify(action.detail)}`,
+      ),
+      dropped: result.droppedActions,
+      note: result.note,
+      eventSeq: result.revisionAtDecision.eventSeq,
+      controlRevision: result.revisionAtDecision.controlRevision,
+    });
+  }
+
+  private persistMemory(kind: "task" | "screen", text: string, sourceRef: string): void {
+    this.store?.appendMemory({
+      kind,
+      text,
+      at: Date.now(),
+      sourceRef,
+      expiresAt: null,
+    });
   }
 
   /**
@@ -614,6 +817,7 @@ export class JarvisRuntime {
     this.unsubscribers.push(
       this.scheduler.onEvent((event) => {
         this.pushTimeline(`task_${event.type}`, describeSchedulerEvent(event));
+        this.persistEvent(event);
         if (event.type === "task_succeeded") {
           const task = this.scheduler.getTask(event.taskId);
           if (task?.resultSummary !== undefined) {
@@ -626,6 +830,8 @@ export class JarvisRuntime {
               priority: task.priority,
               at: Date.now(),
             });
+            // 语义记忆：任务结果摘要（来源可追溯到具体任务）
+            this.persistMemory("task", task.spokenSummary ?? task.resultSummary, `task:${task.taskId}`);
           }
         }
         if (event.type === "task_succeeded" || event.type === "task_failed" || event.type === "task_cancelled") {
@@ -702,6 +908,7 @@ export class JarvisRuntime {
       this.lastDecision = toDecisionView(result);
       this.dialogue.appendSystem(`交付决策（${decision.route}）：${describeDecision(this.lastDecision)}`);
       this.pushTimeline("delivery_decision", describeDecision(this.lastDecision));
+      this.persistDecision(result, "delivery");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger?.warn("runtime.delivery_decision_failed", { error: message });
@@ -726,6 +933,24 @@ export class JarvisRuntime {
       }
     }
   }
+}
+
+/**
+ * 从持久化任务里找出最大的 `task-N` 序号。
+ *
+ * 为什么必须做：调度器的序号是内存态，重启后从 1 重新开始，
+ * 新任务就会复用已存在的 taskId —— 而 `saveTask` 是按 task_id upsert 的，
+ * 于是**历史任务的结果被覆盖**。这个缺陷是在跑真实重启流程时暴露的。
+ */
+export function maxTaskOrdinal(tasks: readonly { readonly taskId: string }[]): number {
+  let max = 0;
+  for (const task of tasks) {
+    const match = /^task-(\d+)$/.exec(task.taskId);
+    if (match === null) continue;
+    const ordinal = Number(match[1]);
+    if (Number.isFinite(ordinal) && ordinal > max) max = ordinal;
+  }
+  return max;
 }
 
 function toTaskView(

@@ -7,7 +7,7 @@
  *
  * 依据：开发实施计划 §3（M0 交付物）、§9（首版不做清单）。
  */
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { DashScopeAsrAdapter } from "./adapters/dashscope/asr-adapter.ts";
@@ -21,7 +21,9 @@ import {
 } from "./adapters/vision/openai-responses-vision-summarizer.ts";
 import { WindowsScreenCapture } from "./adapters/windows/windows-screen-capture.ts";
 import { WindowsScreenImage } from "./adapters/windows/windows-screen-image.ts";
+import { SqliteStore } from "./adapters/sqlite/sqlite-store.ts";
 import type { ScreenFilterOptions } from "./application/screen/screen-filter.ts";
+import type { PersistencePort } from "./application/storage/store-port.ts";
 import { JarvisRuntime, ASR_SAMPLE_RATE, type ScreenWiringOptions } from "./application/runtime.ts";
 import type { TtsPort } from "./application/delivery/tts-port.ts";
 import type { AsrPort } from "./application/input/asr-port.ts";
@@ -308,6 +310,32 @@ function readScreenPollMs(): number | undefined {
 }
 
 /**
+ * 组合根：持久化（M7）。
+ *
+ * **持久化失败不能阻止应用启动** —— 退回纯内存模式，但要把这件事说出来，
+ * 而不是静默降级（否则用户会以为历史被保存了）。
+ */
+function buildStore(config: AppConfig, log: Logger): PersistencePort | undefined {
+  try {
+    const dataDir = process.env["JARVIS_DATA_DIR"] ?? join(config.workspace, ".data");
+    mkdirSync(dataDir, { recursive: true });
+    const path = join(dataDir, "jarvis.db");
+    const store = new SqliteStore({ path });
+    log.info("app.store.ready", {
+      path,
+      note: "node:sqlite（实验性 API，会打印 ExperimentalWarning）",
+    });
+    return store;
+  } catch (error) {
+    log.warn("app.store.unavailable", {
+      error: error instanceof Error ? error.message : String(error),
+      note: "持久化不可用，将以纯内存模式运行：重启后历史与恢复核对都会丢失",
+    });
+    return undefined;
+  }
+}
+
+/**
  * 演示模式（Milestone Alpha）：启动可视化面板，把聊天 → Master → Scheduler →
  * 真实 Worker → 结果 → 交付队列 → 音频仲裁（模拟或真实 TTS）整条链路跑起来。
  */
@@ -322,6 +350,7 @@ async function runDemo(config: AppConfig, log: Logger): Promise<number> {
   const tts = buildTtsAdapter(config, log);
   const asr = buildAsrAdapter(config, log);
   const screen = buildScreenWiring(config, log);
+  const store = buildStore(config, log);
   const runtime = new JarvisRuntime({
     config,
     selected,
@@ -329,6 +358,7 @@ async function runDemo(config: AppConfig, log: Logger): Promise<number> {
     ...(tts === undefined ? {} : { tts }),
     ...(asr === undefined ? {} : { asr }),
     ...(screen === undefined ? {} : { screen }),
+    ...(store === undefined ? {} : { store }),
   });
   const rawPort = process.env["JARVIS_DEMO_PORT"];
   const port = rawPort === undefined ? DEFAULT_DEMO_PORT : Number(rawPort);

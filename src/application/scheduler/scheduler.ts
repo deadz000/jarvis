@@ -72,6 +72,13 @@ export interface SchedulerOptions {
   readonly logger?: Logger;
   /** 面向 Master 的活动任务视图上限（有界视图）。 */
   readonly activeViewLimit?: number;
+  /**
+   * taskId 序号的起始值（默认 1）。
+   *
+   * **重启后必须从持久化的最大序号 +1 开始**，否则新任务会复用已存在的 taskId，
+   * 覆盖掉历史任务的结果 —— 这是 M7 落库时实际发生过的缺陷（见 ADR/提交记录）。
+   */
+  readonly initialTaskOrdinal?: number;
 }
 
 export const DEFAULT_ACTIVE_VIEW_LIMIT = 5;
@@ -125,7 +132,7 @@ export class TaskScheduler {
   private readonly listeners = new Set<(event: SchedulerEvent) => void>();
   private readonly unsubscribeRuntime: () => void;
 
-  private nextTaskOrdinal = 1;
+  private nextTaskOrdinal: number;
   private admitting = false;
   private disposed = false;
 
@@ -137,6 +144,8 @@ export class TaskScheduler {
     this.now = options.now ?? (() => Date.now());
     this.maxConcurrent = options.maxConcurrent;
     this.logger = options.logger;
+    // 重启后由调用方传入持久化的最大序号 +1，避免 taskId 复用覆盖历史
+    this.nextTaskOrdinal = options.initialTaskOrdinal ?? 1;
     this.activeViewLimit = options.activeViewLimit ?? DEFAULT_ACTIVE_VIEW_LIMIT;
     this.unsubscribeRuntime = this.runtime.subscribe((event) => {
       this.handleWorkerEvent(event);
