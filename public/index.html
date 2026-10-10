@@ -97,6 +97,7 @@
 </style>
 </head>
 <body>
+<div id="fatal" style="display:none; margin:10px 14px; padding:10px 12px; border-radius:8px; background:#3d1418; border:1px solid #f85149; color:#ffb4ab; font-size:13px;"></div>
 <header>
   <h1>jarvis<span>主从多 Agent 任务调度 · Milestone Alpha 演示</span></h1>
   <div class="meta">
@@ -149,6 +150,21 @@ const QUICK = [
 ];
 
 const el = (id) => document.getElementById(id);
+
+/**
+ * 载入期错误必须**可见**。
+ * 之前的教训：脚本第 5 行抛 TDZ 错误导致后续全部不执行（EventSource 没建、
+ * 面板永不更新），但界面上毫无提示，只表现为「一直决策中」。
+ */
+function showFatal(message) {
+  const banner = document.getElementById("fatal");
+  if (!banner) return;
+  banner.style.display = "block";
+  banner.textContent = "页面脚本错误（请把这条信息发给我）：" + message;
+}
+window.addEventListener("error", (event) => showFatal(event.message ?? String(event.error)));
+window.addEventListener("unhandledrejection", (event) => showFatal(String(event.reason)));
+
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => (
   { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
 ));
@@ -238,20 +254,28 @@ function playPcmChunk(chunk) {
   source.onended = () => activeSources.delete(source);
 }
 
-events.addEventListener("audio", (message) => {
-  try {
-    const chunk = JSON.parse(message.data);
-    // 第二道保险：旧播放代次的分片直接丢弃（服务端已拒绝过一次）
-    if (chunk.token < playbackToken) return;
-    if (chunk.token > playbackToken) {
-      playbackToken = chunk.token;
-      stopLocalPlayback();
+/**
+ * 音频流监听器注册。
+ * 刻意做成函数并在 EventSource 创建**之后**调用：
+ * 之前把 events.addEventListener 写在 const events = new EventSource 之前，
+ * 触发 TDZ 错误导致整段脚本中断、页面永远停在「决策中」。
+ */
+function attachAudioStream(source) {
+  source.addEventListener("audio", (message) => {
+    try {
+      const chunk = JSON.parse(message.data);
+      // 第二道保险：旧播放代次的分片直接丢弃（服务端已拒绝过一次）
+      if (chunk.token < playbackToken) return;
+      if (chunk.token > playbackToken) {
+        playbackToken = chunk.token;
+        stopLocalPlayback();
+      }
+      playPcmChunk(chunk);
+    } catch (error) {
+      console.error("音频分片解析失败", error);
     }
-    playPcmChunk(chunk);
-  } catch (error) {
-    console.error("音频分片解析失败", error);
-  }
-});
+  });
+}
 
 el("stop").onclick = () => {
   stopLocalPlayback();   // 本地先停（<100ms），再让后端取消服务端合成
@@ -381,6 +405,7 @@ function render(snapshot) {
 }
 
 const events = new EventSource("/api/events");
+attachAudioStream(events);
 events.onopen = () => { el("conn").classList.add("live"); el("conn-text").textContent = "实时"; };
 events.onerror = () => { el("conn").classList.remove("live"); el("conn-text").textContent = "重连中…"; };
 events.onmessage = (message) => {
