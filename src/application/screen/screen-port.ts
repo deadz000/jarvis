@@ -60,6 +60,35 @@ export interface ScreenSummary {
   readonly fromModel: boolean;
 }
 
+/**
+ * 用于摘要的**一张**降采样图片。
+ *
+ * 与 `ScreenFrame` 的区别很重要：`ScreenFrame` 每轮轮询都会产生、**不含像素**；
+ * `ScreenImage` 只在攒批出批、真正要调模型摘要时**才物化一次**。
+ * 这样"图像"的存在时间与范围都被压到最小。
+ *
+ * ⚠️ 隐私含义：摘要步骤会把这张图**发送给模型 API**。
+ * 帧仍然不落盘，但确实离开了本机 —— 这与"帧不出本机"是两个不同的保证，
+ * 决策清单里已分别记录。
+ */
+export interface ScreenImage {
+  readonly jpegBase64: string;
+  readonly width: number;
+  readonly height: number;
+  readonly capturedAt: number;
+  readonly byteLength: number;
+}
+
+export interface ScreenImagePort {
+  captureImage(): Promise<ScreenImage>;
+}
+
+export interface ScreenSummarizeInput {
+  readonly frames: readonly ScreenFrame[];
+  /** 代表性图片（通常取该批最后一帧，最接近"现在"）。 */
+  readonly image: ScreenImage;
+}
+
 export interface ScreenSummarizerPort {
-  summarize(frames: readonly ScreenFrame[]): Promise<ScreenSummary>;
+  summarize(input: ScreenSummarizeInput): Promise<ScreenSummary>;
 }
