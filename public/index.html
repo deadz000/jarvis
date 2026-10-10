@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>jarvis · 主从多 Agent 调度演示</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel-2: #1c2230; --line: #2a3240;
+    --fg: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149; --slate: #6e7681;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 5;
+  }
+  h1 { font-size: 16px; margin: 0; font-weight: 650; }
+  h1 span { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 8px; }
+  .meta { display: flex; gap: 14px; align-items: center; font-size: 12px; color: var(--muted); }
+  .meta b { color: var(--fg); font-weight: 600; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); display: inline-block; }
+  .dot.live { background: var(--ok); }
+  main {
+    display: grid; grid-template-columns: minmax(280px, 1fr) minmax(360px, 1.5fr) minmax(260px, 0.9fr);
+    gap: 14px; padding: 14px; align-items: start;
+  }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600; letter-spacing: .3px; }
+  h2 span { color: var(--fg); font-weight: 500; }
+  textarea {
+    width: 100%; min-height: 76px; resize: vertical; background: var(--panel-2);
+    color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px;
+    font: inherit;
+  }
+  button {
+    background: var(--accent); color: #08111f; border: 0; border-radius: 7px;
+    padding: 8px 12px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.1); }
+  button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); font-weight: 500; }
+  button.tiny { padding: 3px 8px; font-size: 12px; font-weight: 500; background: transparent; color: var(--err); border: 1px solid var(--err); }
+  button:disabled { opacity: .5; cursor: default; }
+  .quick { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .quick button { font-size: 12px; font-weight: 500; background: var(--panel-2); color: var(--fg); border: 1px solid var(--line); padding: 5px 9px; }
+  .card {
+    background: var(--panel-2); border: 1px solid var(--line); border-left: 3px solid var(--slate);
+    border-radius: 8px; padding: 10px 12px; margin-bottom: 9px;
+  }
+  .card.queued { border-left-color: var(--slate); }
+  .card.running { border-left-color: var(--accent); }
+  .card.cancel_requested { border-left-color: var(--warn); }
+  .card.succeeded { border-left-color: var(--ok); }
+  .card.failed { border-left-color: var(--err); }
+  .card.cancelled { border-left-color: #484f58; opacity: .82; }
+  .card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .card-id { font-size: 12px; color: var(--muted); font-family: ui-monospace, Consolas, monospace; }
+  .badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); }
+  .badge.running { color: var(--accent); border-color: var(--accent); }
+  .badge.succeeded { color: var(--ok); border-color: var(--ok); }
+  .badge.failed { color: var(--err); border-color: var(--err); }
+  .badge.cancel_requested { color: var(--warn); border-color: var(--warn); }
+  .goal { margin: 5px 0 6px; }
+  .sub { font-size: 12px; color: var(--muted); }
+  .result { margin-top: 7px; padding-top: 7px; border-top: 1px dashed var(--line); font-size: 13px; white-space: pre-wrap; }
+  .err-text { color: var(--err); }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+  .audio-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; font-size: 13px; }
+  .audio-grid .k { color: var(--muted); }
+  .kv { display: flex; justify-content: space-between; font-size: 12px; padding: 3px 0; border-bottom: 1px dashed var(--line); }
+  .timeline { margin: 0 14px 20px; }
+  #timeline { max-height: 240px; overflow-y: auto; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .tl-row { display: grid; grid-template-columns: 74px 150px 1fr; gap: 8px; padding: 2px 0; border-bottom: 1px solid rgba(42,50,64,.4); }
+  .tl-kind { color: var(--muted); }
+  .tl-kind.audio { color: #a371f7; }
+  .tl-kind.decision { color: var(--accent); }
+  .tl-kind.task { color: var(--ok); }
+  .empty { color: var(--muted); font-size: 12px; font-style: italic; }
+  .decision { margin-top: 10px; font-size: 12px; color: var(--muted); white-space: pre-wrap; }
+  .decision b { color: var(--fg); }
+</style>
+</head>
+<body>
+<header>
+  <h1>jarvis<span>主从多 Agent 任务调度 · Milestone Alpha 演示</span></h1>
+  <div class="meta">
+    <span>模型 <b id="model">—</b></span>
+    <span>revision <b id="revision">e0 / c0</b></span>
+    <span><span class="dot" id="conn"></span> <b id="conn-text">连接中…</b></span>
+  </div>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>对话输入</h2>
+    <div class="quick" id="quick"></div>
+    <textarea id="input" placeholder="例如：查一下今天的天气，同时总结最近三次 Git 提交"></textarea>
+    <div class="row"><button id="send">发送（走 Master 决策链路）</button></div>
+    <div class="decision" id="decision"></div>
+  </section>
+
+  <section class="panel">
+    <h2>任务面板 <span id="task-count"></span></h2>
+    <div id="tasks"><div class="empty">还没有任务。发一条消息试试。</div></div>
+  </section>
+
+  <section class="panel">
+    <h2>交付队列 <span id="delivery-count"></span></h2>
+    <div id="deliveries"><div class="empty">暂无结果</div></div>
+    <h2 style="margin-top:14px">音频仲裁（模拟 TTS）</h2>
+    <div class="audio-grid" id="audio"></div>
+    <div class="row">
+      <button id="stop" class="ghost">模拟用户开口 → 停播</button>
+      <button id="replay" class="ghost">重放旧代次分片</button>
+    </div>
+  </section>
+</main>
+
+<section class="panel timeline">
+  <h2>事件时间线 <span id="tl-count"></span></h2>
+  <div id="timeline"></div>
+</section>
+
+<script>
+const QUICK = [
+  ["查天气 + 总结 Git 提交", "查一下今天的天气，同时总结最近三次 Git 提交"],
+  ["分析 Git 并总结风险（单任务多步骤）", "分析项目最近的 Git 提交，并根据分析结果总结项目风险"],
+  ["取消天气任务（走 Master 推断）", "天气不用查了，继续分析 Git 提交，把焦点放在 Git 那个任务上"],
+];
+
+const el = (id) => document.getElementById(id);
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => (
+  { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+));
+const ago = (at) => {
+  const seconds = (Date.now() - at) / 1000;
+  if (seconds < 60) return seconds.toFixed(1) + "s 前";
+  return Math.floor(seconds / 60) + "m 前";
+};
+
+for (const [label, text] of QUICK) {
+  const button = document.createElement("button");
+  button.textContent = label;
+  button.onclick = () => { el("input").value = text; send(); };
+  el("quick").appendChild(button);
+}
+
+async function post(url, body) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  });
+  return response.json();
+}
+
+async function send() {
+  const text = el("input").value.trim();
+  if (!text) return;
+  el("send").disabled = true;
+  el("decision").innerHTML = "<b>Master 决策中…</b>（真实模型调用，通常 2–4s）";
+  try {
+    const result = await post("/api/chat", { text });
+    if (!result.ok) el("decision").innerHTML = '<span class="err-text">' + esc(result.error) + "</span>";
+  } catch (error) {
+    el("decision").innerHTML = '<span class="err-text">请求失败：' + esc(error) + "</span>";
+  } finally {
+    el("send").disabled = false;
+  }
+}
+
+el("send").onclick = send;
+el("input").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) send();
+});
+el("stop").onclick = () => post("/api/audio/stop");
+el("replay").onclick = async () => {
+  const result = await post("/api/audio/replay-stale");
+  if (result.replayedToken === null) {
+    el("decision").innerHTML = "还没停播过，先点「模拟用户开口 → 停播」再重放旧代次分片。";
+  }
+};
+
+function renderTasks(tasks) {
+  el("task-count").textContent = tasks.length ? "(" + tasks.length + ")" : "";
+  if (!tasks.length) {
+    el("tasks").innerHTML = '<div class="empty">还没有任务。发一条消息试试。</div>';
+    return;
+  }
+  el("tasks").innerHTML = tasks.map((task) => {
+    const active = task.state === "running" || task.state === "queued";
+    const timing = task.startedAt
+      ? (task.terminalAt ? "耗时 " + ((task.terminalAt - task.startedAt) / 1000).toFixed(1) + "s" : "开始于 " + ago(task.startedAt))
+      : "等待准入";
+    const body = task.resultSummary
+      ? '<div class="result">' + esc(task.resultSummary) + "</div>"
+      : task.failureReason
+        ? '<div class="result err-text">失败：' + esc(task.failureReason) + "</div>"
+        : task.cancelReason
+          ? '<div class="result">取消原因：' + esc(task.cancelReason) + "</div>"
+          : "";
+    return '<div class="card ' + task.state + '">'
+      + '<div class="card-head"><span class="card-id">' + esc(task.taskId) + " · gen " + task.runGeneration
+      + " · " + esc(task.priority) + '</span><span class="badge ' + task.state + '">' + esc(task.state) + "</span></div>"
+      + '<div class="goal">' + esc(task.goal) + "</div>"
+      + '<div class="sub">' + timing + "</div>"
+      + body
+      + (active ? '<div class="row"><button class="tiny" data-cancel="' + esc(task.taskId) + '">取消这个任务</button></div>' : "")
+      + "</div>";
+  }).join("");
+}
+
+document.addEventListener("click", async (event) => {
+  const taskId = event.target?.dataset?.cancel;
+  if (!taskId) return;
+  event.target.disabled = true;
+  await post("/api/cancel", { taskId });
+});
+
+function renderDeliveries(items) {
+  const pending = items.filter((item) => item.status !== "delivered").length;
+  el("delivery-count").textContent = items.length ? "(" + pending + " 待交付 / " + items.length + " 总)" : "";
+  if (!items.length) {
+    el("deliveries").innerHTML = '<div class="empty">暂无结果</div>';
+    return;
+  }
+  el("deliveries").innerHTML = items.map((item) => (
+    '<div class="kv"><span>' + esc(item.taskId) + " · " + esc(item.priority) + "</span><span>"
+    + ({ queued: "排队中", playing: "播报中", delivered: "已交付" }[item.status] ?? esc(item.status))
+    + "</span></div>"
+  )).join("");
+}
+
+function renderAudio(audio) {
+  const rows = [
+    ["播报状态", audio.playing ? "正在播报 " + esc(audio.taskId) : "空闲"],
+    ["当前播放代次", "#" + audio.token],
+    ["已作废代次", audio.stoppedToken === null ? "—" : "#" + audio.stoppedToken],
+    ["分片：已播出 / 已拒绝", audio.stats.delivered + " / " + audio.stats.rejected],
+    ["授权 / 完成 / 停播", audio.stats.granted + " / " + audio.stats.finished + " / " + audio.stats.stopped],
+  ];
+  el("audio").innerHTML = rows.map(([k, v]) => '<span class="k">' + k + "</span><span>" + v + "</span>").join("");
+}
+
+function renderDecision(decision) {
+  if (!decision) return;
+  const parts = [];
+  parts.push("<b>" + esc(decision.status) + "</b> · " + decision.elapsedMs + "ms"
+    + (decision.stale ? " · 基于旧修订号（已逐动作复核）" : ""));
+  if (decision.note) parts.push('<span class="err-text">' + esc(decision.note) + "</span>");
+  for (const action of decision.applied) parts.push("✅ " + esc(action.type) + "：" + esc(action.detail));
+  for (const rejected of decision.rejected) parts.push("⛔ " + esc(rejected.type) + " 被拒：" + esc(rejected.reason));
+  el("decision").innerHTML = parts.join("<br>");
+}
+
+function renderTimeline(entries) {
+  el("tl-count").textContent = entries.length ? "(" + entries.length + ")" : "";
+  const rows = entries.slice(-90).reverse();
+  if (!rows.length) {
+    el("timeline").innerHTML = '<div class="empty">等待事件…</div>';
+    return;
+  }
+  el("timeline").innerHTML = rows.map((entry) => {
+    const group = entry.kind.startsWith("audio") ? "audio" : entry.kind.startsWith("delivery") ? "decision" : entry.kind.startsWith("task") ? "task" : "";
+    return '<div class="tl-row"><span>' + new Date(entry.at).toLocaleTimeString("zh-CN", { hour12: false })
+      + '</span><span class="tl-kind ' + group + '">' + esc(entry.kind) + "</span><span>"
+      + esc(entry.text) + "</span></div>";
+  }).join("");
+}
+
+function render(snapshot) {
+  el("model").textContent = snapshot.model.provider + "/" + snapshot.model.id;
+  el("revision").textContent = "e" + snapshot.revision.eventSeq + " / c" + snapshot.revision.controlRevision;
+  renderTasks(snapshot.tasks);
+  renderDeliveries(snapshot.deliveries);
+  renderAudio(snapshot.audio);
+  renderDecision(snapshot.lastDecision);
+  renderTimeline(snapshot.timeline);
+}
+
+const events = new EventSource("/api/events");
+events.onopen = () => { el("conn").classList.add("live"); el("conn-text").textContent = "实时"; };
+events.onerror = () => { el("conn").classList.remove("live"); el("conn-text").textContent = "重连中…"; };
+events.onmessage = (message) => {
+  try { render(JSON.parse(message.data)); } catch (error) { console.error(error); }
+};
+
+fetch("/api/state").then((r) => r.json()).then(render).catch(() => {});
+</script>
+</body>
+</html>

@@ -10,6 +10,7 @@
   "scripts": {
     "check": "node --env-file-if-exists=.env src/app.ts --check",
     "start": "node --env-file-if-exists=.env src/app.ts",
+    "demo": "node --env-file-if-exists=.env src/app.ts --demo",
     "example:sdk": "node --env-file-if-exists=.env examples/sdk/01-minimal.ts",
     "example:abort": "node --env-file-if-exists=.env examples/sdk/02-abort-and-tools.ts",
     "example:workers": "node --env-file-if-exists=.env examples/sdk/03-two-workers.ts",

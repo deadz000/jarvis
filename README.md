@@ -12,6 +12,7 @@
 
 | 里程碑 | 状态 | 说明 |
 |---|---|---|
+| **Milestone Alpha（首个可演示增量）** | ✅ 完成 | 可视化面板：聊天 → Master 决策 → 并行 Worker → 任务面板 → 取消隔离 → 交付队列 → 模拟音频仲裁。见 [演示脚本](docs/演示脚本_v0.1.md) |
 | **M0 项目初始化与 SDK 核验** | ✅ 完成 | 工程骨架、锁定依赖、配置/日志、ADR-001、最小 Session 示例；真实模型调用已实测通过 |
 | **M1 单 Agent Runtime PoC** | ✅ 完成 | 事件生命周期、自定义工具闭环、`abort` 传递到工具层、`steer` 契约、重复请求/退订/dispose/会话持久化差异。ADR-001 §3.2 记录了三个实测陷阱 |
 | **M2 Worker Runtime Adapter** | ✅ 完成 | 真实 Pi Worker 适配器 + 确定性 FakeWorker。**真实 Session 并行重叠 1818ms、上下文隔离、取消隔离均已实测** |
@@ -77,6 +78,7 @@ npm run example:sdk -- "用一句话介绍这个仓库"
 
 | 命令 | 作用 |
 |---|---|
+| `npm run demo` | **启动可视化演示面板**（默认 http://127.0.0.1:7717），见 [演示脚本](docs/演示脚本_v0.1.md) |
 | `npm run check` | 配置自检：校验环境变量、报告检测到的 provider（不调用模型） |
 | `npm test` | vitest 单元测试 |
 | `npm run typecheck` | `tsc --noEmit` 全量类型检查 |
@@ -101,9 +103,13 @@ src/
     state-machine.ts              # 合法转移表（数据声明，可穷举测试）
   domain/decision/types.ts        # MasterDecision 契约与两维版本号
   application/
+    runtime.ts                    # 演示运行时装配（把各部件串成一条链路）
     scheduler/scheduler.ts        # 确定性 Scheduler：唯一写入口、准入、取消、代次
     workers/ports.ts              # WorkerRuntime 端口（含取消与事件契约）
     interaction/focus.ts          # 交互焦点（独立状态维度）
+    delivery/
+      audio-manager.ts            # 模拟 Audio Manager：播放代次仲裁（旧代次被拒绝）
+      delivery-queue.ts           # 交付队列：不抢占、播完后按优先级交付
     master/
       context-view.ts             # 有界世界视图 + 两维版本号
       decision-parser.ts          # 输出解析与 Schema 校验（不含业务规则）
@@ -111,6 +117,7 @@ src/
       decision-plane.ts           # 决策周期编排 + 超时降级
       master-prompt.ts            # 提示词模板
   adapters/
+    http/demo-server.ts           # 演示服务：静态面板 + SSE + 命令接口
     pi/session-outcome.ts         # Pi 终态判定（含 abort/取消的特殊性）
     pi/pi-worker-runtime.ts       # 真实 Pi Worker 适配器
     pi/pi-master.ts               # 真实 Pi Master 适配器（无工具，只出建议）
@@ -120,6 +127,7 @@ examples/sdk/
   01-minimal.ts                   # 最小 Session 示例
   02-abort-and-tools.ts           # M1 实测：自定义工具 + 取消传递
 config/models.json                # 自定义端点声明（不含密钥）
+public/index.html                 # 可视化面板（单文件，无前端依赖）
 tests/unit/                       # 状态机、Scheduler、配置、日志、终态判定
 docs/
   项目文档索引_v0.1.md
