@@ -25,6 +25,18 @@ export interface PendingResult {
   readonly spokenSummary: string;
   readonly priority: Priority;
   readonly at: number;
+  /**
+   * 结果自身的**事实标记**（由 Worker 自评提供）。
+   *
+   * 注意：这些是「结果自身属性」，**不是重要性** —— 重要性是相对的，
+   * 需要参照物（用户此刻在问什么、在听什么），由交付策略决定是否交给 Master 判断。
+   */
+  readonly hints?: {
+    readonly needsUserDecision?: boolean;
+    readonly hasBlocker?: boolean;
+    readonly isBadNews?: boolean;
+    readonly isPartial?: boolean;
+  };
 }
 
 export interface DeliveryBatcherOptions {

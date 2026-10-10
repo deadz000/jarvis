@@ -118,6 +118,10 @@
       <button id="stop" class="ghost">模拟用户开口 → 停播</button>
       <button id="replay" class="ghost">重放旧代次分片</button>
     </div>
+    <div class="row">
+      <button id="speech" class="ghost">模拟用户正在讲话</button>
+      <span class="sub" id="speech-state">语音交付：可交付</span>
+    </div>
   </section>
 </main>
 
@@ -179,6 +183,8 @@ el("input").addEventListener("keydown", (event) => {
   if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) send();
 });
 el("stop").onclick = () => post("/api/audio/stop");
+el("speech").onclick = () => post("/api/speech", { active: !speechActive });
+let speechActive = false;
 el("replay").onclick = async () => {
   const result = await post("/api/audio/replay-stale");
   if (result.replayedToken === null) {
@@ -281,6 +287,9 @@ function renderTimeline(entries) {
 function render(snapshot) {
   el("model").textContent = snapshot.model.provider + "/" + snapshot.model.id;
   el("revision").textContent = "e" + snapshot.revision.eventSeq + " / c" + snapshot.revision.controlRevision;
+  speechActive = snapshot.speechActive === true;
+  el("speech-state").textContent = speechActive ? "语音交付：让路（面板照常更新）" : "语音交付：可交付";
+  el("speech").textContent = speechActive ? "模拟用户停止讲话" : "模拟用户正在讲话";
   renderTasks(snapshot.tasks);
   renderDeliveries(snapshot.deliveries);
   renderAudio(snapshot.audio);

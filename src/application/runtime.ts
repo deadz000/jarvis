@@ -28,6 +28,7 @@ import { MasterDecisionPlane } from "./master/decision-plane.ts";
 import { TaskScheduler } from "./scheduler/scheduler.ts";
 import { DeliveryQueue } from "./delivery/delivery-queue.ts";
 import { DeliveryBatcher, type PendingResult } from "./delivery/delivery-batcher.ts";
+import { DeliveryPolicy } from "./delivery/delivery-policy.ts";
 import { SimulatedAudioManager } from "./delivery/audio-manager.ts";
 
 export interface TaskView {
@@ -82,6 +83,8 @@ export interface RuntimeSnapshot {
   readonly timeline: readonly TimelineEntry[];
   /** 有界对话记忆（最近若干条），让面板能看出"系统记得什么"。 */
   readonly dialogue: readonly DialogueEntry[];
+  /** 用户是否正在讲话（语音交付是否让路）。 */
+  readonly speechActive: boolean;
 }
 
 export interface JarvisRuntimeOptions {
@@ -107,6 +110,7 @@ export class JarvisRuntime {
   private readonly audio: SimulatedAudioManager;
   private readonly delivery: DeliveryQueue;
   private readonly batcher: DeliveryBatcher;
+  private readonly policy = new DeliveryPolicy();
 
   private readonly listeners = new Set<(snapshot: RuntimeSnapshot) => void>();
   private readonly unsubscribers: Array<() => void> = [];
@@ -114,6 +118,9 @@ export class JarvisRuntime {
 
   private lastDecision: DecisionView | null = null;
   private stoppedToken: number | null = null;
+  private speechActive = false;
+  /** 因用户讲话而暂缓的语音交付批次（面板已经更新过，语音等合适时机）。 */
+  private deferredResults: PendingResult[] = [];
   private disposed = false;
 
   public constructor(options: JarvisRuntimeOptions) {
@@ -228,7 +235,28 @@ export class JarvisRuntime {
       lastDecision: this.lastDecision,
       timeline: [...this.timeline],
       dialogue: this.dialogue.recent(10),
+      speechActive: this.speechActive,
     };
+  }
+
+  /**
+   * 用户讲话状态（真实实现由 ASR/VAD 提供；未接入前可由面板手动模拟）。
+   *
+   * 讲话期间：**面板照常更新**（结果已在快照里可见），语音交付让路；
+   * 讲话结束后把暂缓的结果放回合并窗口，与期间新产生的合批处理。
+   */
+  public setSpeechActive(active: boolean): void {
+    if (this.speechActive === active) return;
+    this.speechActive = active;
+    this.pushTimeline("speech_activity", active ? "用户开始讲话：语音交付让路" : "用户停止讲话：恢复语音交付");
+
+    if (!active && this.deferredResults.length > 0) {
+      const restored = this.deferredResults;
+      this.deferredResults = [];
+      this.pushTimeline("delivery_restored", `${restored.length} 条暂缓结果重新进入合并窗口`);
+      for (const item of restored) this.batcher.add(item);
+    }
+    this.emitUpdate();
   }
 
   public onUpdate(listener: (snapshot: RuntimeSnapshot) => void): () => void {
@@ -290,18 +318,55 @@ export class JarvisRuntime {
   }
 
   /**
-   * 结果批次出窗口后的一次交付决策。
-   * 失败/超时不会丢结果 —— 决策平面内部有确定性兜底交付。
+   * 结果批次出窗口后的交付处理。
+   *
+   * **先由确定性策略分流**决定是否值得调用 Master（这是「不必为每个完成事件完整推理」的落点）：
+   * - `direct`：单个普通结果，直接用自带口语稿，零 LLM 成本；
+   * - `master_merge` / `master_priority`：多条需合并，或需语义判断重要性；
+   * - `defer_for_speech`：用户正在讲话，面板先更新，语音等合适时机。
    */
   private async runDeliveryDecision(batch: readonly PendingResult[]): Promise<void> {
+    const decision = this.policy.decide({
+      batch,
+      speechActive: this.speechActive,
+      audioPlaying: this.audio.isPlaying,
+      runningTaskCount: this.scheduler.stats().running,
+    });
+
     this.pushTimeline(
-      "delivery_batch",
-      `${batch.length} 条结果出合并窗口：${batch.map((item) => item.taskId).join("、")}`,
+      "delivery_route",
+      `${batch.length} 条结果 → ${decision.route}（${decision.reasons.join("；")}）`,
     );
+
+    if (decision.route === "defer_for_speech") {
+      this.deferredResults.push(...batch);
+      this.pushTimeline(
+        "delivery_deferred",
+        `语音交付暂缓，已保留 ${this.deferredResults.length} 条结果（面板已更新）`,
+      );
+      this.emitUpdate();
+      return;
+    }
+
+    if (decision.route === "direct") {
+      const applied = batch.map((item) => {
+        const entry = this.delivery.enqueue({
+          taskId: item.taskId,
+          summary: item.spokenSummary,
+          priority: item.priority,
+        });
+        return `${item.taskId} → ${entry.id}`;
+      });
+      this.dialogue.appendSystem(`直接交付 ${batch.length} 条结果（未调用 Master）`);
+      this.pushTimeline("delivery_direct", applied.join("；"));
+      this.emitUpdate();
+      return;
+    }
+
     try {
       const result = await this.plane.decideDelivery(batch);
       this.lastDecision = toDecisionView(result);
-      this.dialogue.appendSystem(`交付决策：${describeDecision(this.lastDecision)}`);
+      this.dialogue.appendSystem(`交付决策（${decision.route}）：${describeDecision(this.lastDecision)}`);
       this.pushTimeline("delivery_decision", describeDecision(this.lastDecision));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

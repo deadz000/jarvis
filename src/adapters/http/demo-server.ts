@@ -152,6 +152,14 @@ export class DemoServer {
         return;
       }
 
+      if (request.method === "POST" && path === "/api/speech") {
+        const body = await readJsonBody(request);
+        const active = body["active"] === true;
+        this.options.runtime.setSpeechActive(active);
+        sendJson(response, 200, { ok: true, speechActive: active });
+        return;
+      }
+
       if (request.method === "POST" && path === "/api/audio/stop") {
         this.options.runtime.stopPlayback();
         sendJson(response, 200, { ok: true });
