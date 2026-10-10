@@ -24,6 +24,7 @@ export type AudioEvent =
   | { type: "playback_granted"; at: number; taskId: string; token: number; chunkCount: number }
   | { type: "playback_chunk_delivered"; at: number; taskId: string; token: number; index: number }
   | { type: "playback_chunk_rejected"; at: number; taskId: string; token: number; index: number }
+  | { type: "playback_stop_requested"; at: number; taskId: string; token: number; reason: string }
   | { type: "playback_finished"; at: number; taskId: string; token: number }
   | { type: "playback_stopped"; at: number; taskId: string; token: number; reason: string };
 
@@ -41,6 +42,8 @@ export interface AudioStats {
   readonly rejected: number;
   readonly stopped: number;
   readonly finished: number;
+  /** 因抢占而在分片边界被停止的次数。 */
+  readonly preemptions: number;
 }
 
 interface ActivePlayback {
@@ -63,7 +66,9 @@ export class SimulatedAudioManager {
   private active: ActivePlayback | undefined;
   /** 最近一次被作废的播放，用于在停播后仍能归属被拒绝的分片。 */
   private lastStopped: { readonly taskId: string; readonly token: number } | undefined;
-  private counters = { granted: 0, delivered: 0, rejected: 0, stopped: 0, finished: 0 };
+  /** 已请求但尚未执行的边界停止（抢占用）。 */
+  private pendingStopReason: string | undefined;
+  private counters = { granted: 0, delivered: 0, rejected: 0, stopped: 0, finished: 0, preemptions: 0 };
 
   public constructor(options: SimulatedAudioOptions = {}) {
     this.now = options.now ?? (() => Date.now());
@@ -111,6 +116,7 @@ export class SimulatedAudioManager {
    */
   public grant(input: { taskId: string; text: string; priority: Priority }): PlaybackGrant {
     if (this.active !== undefined) this.stop("被新的播放授权取代");
+    this.pendingStopReason = undefined;
 
     this.token += 1;
     const token = this.token;
@@ -129,12 +135,36 @@ export class SimulatedAudioManager {
     const active = this.active;
     if (active === undefined) return false;
 
+    this.pendingStopReason = undefined;
     active.cancelTimer?.();
     this.active = undefined;
     this.lastStopped = { taskId: active.taskId, token: active.token };
     this.token += 1; // 关键：代次前进，旧分片一律失效
     this.counters = { ...this.counters, stopped: this.counters.stopped + 1 };
     this.emit({ type: "playback_stopped", at: this.now(), taskId: active.taskId, token: active.token, reason });
+    return true;
+  }
+
+  /**
+   * 请求在**下一个分片边界**停止播放。
+   *
+   * 用于已确认的产品规则「仅 urgent 可抢占，且只在分片边界停」：
+   * 立即切断会把句子截成两半，边界停止让当前语句自然收尾。
+   * 返回是否接受了该请求（已有待执行的边界停止、或当前没有播放时返回 false）。
+   */
+  public requestStopAtBoundary(reason: string): boolean {
+    const active = this.active;
+    if (active === undefined) return false;
+    if (this.pendingStopReason !== undefined) return false;
+
+    this.pendingStopReason = reason;
+    this.emit({
+      type: "playback_stop_requested",
+      at: this.now(),
+      taskId: active.taskId,
+      token: active.token,
+      reason,
+    });
     return true;
   }
 
@@ -171,6 +201,16 @@ export class SimulatedAudioManager {
       this.emit({ type: "playback_finished", at: this.now(), taskId: active.taskId, token });
       return;
     }
+
+    // 抢占：在分片边界停（不截断句子中段）
+    if (this.pendingStopReason !== undefined) {
+      const reason = this.pendingStopReason;
+      this.pendingStopReason = undefined;
+      this.counters = { ...this.counters, preemptions: this.counters.preemptions + 1 };
+      this.stop(reason);
+      return;
+    }
+
     this.scheduleNext(token);
   }
 

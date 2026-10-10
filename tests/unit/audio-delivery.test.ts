@@ -226,3 +226,71 @@ describe("DeliveryQueue — 交付策略（FR-09）", () => {
     expect(events.some((event) => event.type === "delivery_delivered")).toBe(true);
   });
 });
+
+describe("urgent 抢占：只在分片边界停（已确认的产品规则）", () => {
+  function setup(chunks = 3) {
+    const scheduler = manualScheduler();
+    const audio = new SimulatedAudioManager({
+      schedule: scheduler.schedule,
+      chunksPerPlayback: chunks,
+      now: () => 1_000,
+    });
+    const delivery = new DeliveryQueue({ audio, now: () => 1_000 });
+    const events: Array<AudioEvent | DeliveryEvent> = [];
+    audio.onEvent((event) => events.push(event));
+    delivery.onEvent((event) => events.push(event));
+    return { scheduler, audio, delivery, events };
+  }
+
+  it("urgent 入队时不立即切断，而是在分片边界停止后优先交付 urgent", () => {
+    const { scheduler, audio, delivery, events } = setup(3);
+
+    delivery.enqueue({ taskId: "task-1", summary: LONG_TEXT, priority: "normal" });
+    expect(audio.currentTaskId).toBe("task-1");
+
+    delivery.enqueue({ taskId: "task-2", summary: LONG_TEXT, priority: "urgent" });
+
+    // 关键：没有立即切断当前语句
+    expect(audio.currentTaskId).toBe("task-1");
+    expect(audio.stats().stopped).toBe(0);
+    expect(delivery.stats().preemptions).toBe(1);
+    expect(events.some((event) => event.type === "delivery_preemption_requested")).toBe(true);
+    expect(events.some((event) => event.type === "playback_stop_requested")).toBe(true);
+
+    // 推进到分片边界 → 停播 → 交付层切到 urgent
+    scheduler.runNext();
+    expect(audio.stats().preemptions).toBe(1);
+    expect(audio.currentTaskId).toBe("task-2");
+  });
+
+  it("普通结果入队不会请求抢占", () => {
+    const { audio, delivery, events } = setup();
+
+    delivery.enqueue({ taskId: "task-1", summary: LONG_TEXT, priority: "normal" });
+    delivery.enqueue({ taskId: "task-2", summary: LONG_TEXT, priority: "normal" });
+
+    expect(delivery.stats().preemptions).toBe(0);
+    expect(events.some((event) => event.type === "playback_stop_requested")).toBe(false);
+    expect(audio.currentTaskId).toBe("task-1");
+  });
+
+  it("正在播 urgent 时不再触发抢占", () => {
+    const { audio, delivery, events } = setup();
+
+    delivery.enqueue({ taskId: "task-1", summary: LONG_TEXT, priority: "urgent" });
+    delivery.enqueue({ taskId: "task-2", summary: LONG_TEXT, priority: "urgent" });
+
+    expect(delivery.stats().preemptions).toBe(0);
+    expect(events.some((event) => event.type === "playback_stop_requested")).toBe(false);
+    expect(audio.currentTaskId).toBe("task-1");
+  });
+
+  it("播放空闲时 urgent 直接开始，不经过抢占路径", () => {
+    const { audio, delivery } = setup();
+
+    delivery.enqueue({ taskId: "task-1", summary: LONG_TEXT, priority: "urgent" });
+
+    expect(audio.currentTaskId).toBe("task-1");
+    expect(delivery.stats().preemptions).toBe(0);
+  });
+});

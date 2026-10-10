@@ -344,6 +344,8 @@ function describeAudioEvent(event: AudioEvent): string {
       return `${event.taskId} 分片 ${event.index} 已播出（token #${event.token}）`;
     case "playback_chunk_rejected":
       return `${event.taskId} 分片 ${event.index} **被拒绝**（token #${event.token} 已失效）`;
+    case "playback_stop_requested":
+      return `${event.taskId} 已请求在分片边界停止：${event.reason}（token #${event.token}）`;
     case "playback_finished":
       return `${event.taskId} 播报完成（token #${event.token}）`;
     case "playback_stopped":
@@ -361,5 +363,7 @@ function describeDeliveryEvent(event: DeliveryEvent): string {
       return `${event.item.taskId} 已交付`;
     case "delivery_deferred":
       return `${event.item.taskId} 交付排队：${event.reason}`;
+    case "delivery_preemption_requested":
+      return `${event.item.taskId} 将被 urgent 结果抢占：${event.reason}`;
   }
 }

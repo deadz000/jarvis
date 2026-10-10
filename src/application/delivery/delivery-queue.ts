@@ -32,7 +32,8 @@ export type DeliveryEvent =
   | { type: "delivery_enqueued"; at: number; item: DeliveryItem; playingTaskId: string | null }
   | { type: "delivery_started"; at: number; item: DeliveryItem }
   | { type: "delivery_delivered"; at: number; item: DeliveryItem }
-  | { type: "delivery_deferred"; at: number; item: DeliveryItem; reason: string };
+  | { type: "delivery_deferred"; at: number; item: DeliveryItem; reason: string }
+  | { type: "delivery_preemption_requested"; at: number; item: DeliveryItem; reason: string };
 
 export interface DeliveryQueueOptions {
   readonly audio: SimulatedAudioManager;
@@ -50,7 +51,7 @@ export class DeliveryQueue {
   private readonly order: string[] = [];
   private readonly unsubscribeAudio: () => void;
   private nextOrdinal = 1;
-  private counters = { enqueued: 0, delivered: 0 };
+  private counters = { enqueued: 0, delivered: 0, preemptions: 0 };
 
   public constructor(options: DeliveryQueueOptions) {
     this.audio = options.audio;
@@ -107,6 +108,7 @@ export class DeliveryQueue {
     this.emit({ type: "delivery_enqueued", at, item, playingTaskId: this.audio.currentTaskId });
 
     this.startNext();
+    this.requestPreemptionIfNeeded();
     return this.itemsById.get(id) ?? item;
   }
 
@@ -114,14 +116,39 @@ export class DeliveryQueue {
     return this.order.map((id) => this.itemsById.get(id)).filter((item): item is DeliveryItem => item !== undefined);
   }
 
-  public stats(): { enqueued: number; delivered: number; queued: number; playing: number } {
+  public stats(): { enqueued: number; delivered: number; queued: number; playing: number; preemptions: number } {
     const items = this.items();
     return {
       enqueued: this.counters.enqueued,
       delivered: this.counters.delivered,
+      preemptions: this.counters.preemptions,
       queued: items.filter((item) => item.status === "queued").length,
       playing: items.filter((item) => item.status === "playing").length,
     };
+  }
+
+  /**
+   * 已确认的产品规则：**仅 `urgent` 可抢占，且只在分片边界停**（不截断句子中段）。
+   *
+   * 这里只发出「边界停止」请求；真正切换发生在音频层的分片边界，
+   * 因此交付层不需要任何实时能力，规则保持确定性、可单测。
+   */
+  private requestPreemptionIfNeeded(): void {
+    if (!this.audio.isPlaying) return;
+
+    const playing = this.items().find((item) => item.status === "playing");
+    if (playing === undefined) return;
+    // 已经在播紧急内容，无需抢占
+    if (playing.priority === "urgent") return;
+
+    const urgentWaiting = this.items().find((item) => item.status === "queued" && item.priority === "urgent");
+    if (urgentWaiting === undefined) return;
+
+    const reason = `urgent 结果 ${urgentWaiting.taskId} 优先：在当前语句的分片边界停止 ${playing.taskId}`;
+    if (!this.audio.requestStopAtBoundary(reason)) return;
+
+    this.counters = { ...this.counters, preemptions: this.counters.preemptions + 1 };
+    this.emit({ type: "delivery_preemption_requested", at: this.now(), item: playing, reason });
   }
 
   /** 播放空闲时取出最高优先级的一条（同优先级 FIFO）。 */

@@ -243,6 +243,7 @@ function renderAudio(audio) {
     ["已作废代次", audio.stoppedToken === null ? "—" : "#" + audio.stoppedToken],
     ["分片：已播出 / 已拒绝", audio.stats.delivered + " / " + audio.stats.rejected],
     ["授权 / 完成 / 停播", audio.stats.granted + " / " + audio.stats.finished + " / " + audio.stats.stopped],
+    ["urgent 抢占（边界停止）", audio.stats.preemptions ?? 0],
   ];
   el("audio").innerHTML = rows.map(([k, v]) => '<span class="k">' + k + "</span><span>" + v + "</span>").join("");
 }
